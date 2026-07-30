@@ -559,6 +559,42 @@ _recover_model_catalog_db() {
     return 1  # signal dashboard restart needed
 }
 
+_recover_maas_gateway() {
+    local gw_ns="openshift-ingress"
+    local gw_name="maas-default-gateway"
+
+    if ! oc get gateway "$gw_name" -n "$gw_ns" &>/dev/null; then
+        return 0
+    fi
+
+    echo "  Checking MaaS Gateway..."
+
+    local gw_label="gateway.networking.k8s.io/gateway-name=${gw_name}"
+    local gw_pod
+    gw_pod=$(oc get pods -n "$gw_ns" -l "$gw_label" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+    if [ -z "$gw_pod" ]; then
+        warn "  MaaS Gateway pod not found"
+        return 0
+    fi
+
+    local maas_api_url="https://maas-api.redhat-ods-applications.svc.cluster.local:8443/health"
+    local http_code
+    http_code=$(oc exec "$gw_pod" -n "$gw_ns" -c istio-proxy -- \
+        curl -sk --connect-timeout 5 --max-time 10 -o /dev/null -w "%{http_code}" "$maas_api_url" 2>/dev/null || echo "000")
+
+    if [ "$http_code" -eq 200 ] 2>/dev/null; then
+        success "  MaaS Gateway → maas-api connectivity OK"
+        return 0
+    fi
+
+    warn "  MaaS Gateway has stale connections (HTTP $http_code from maas-api)"
+    echo "  Restarting gateway pod to re-establish connections..."
+    oc delete pod "$gw_pod" -n "$gw_ns" --wait=false &>/dev/null || true
+    _wait_for_pod_ready "$gw_label" "$gw_ns" 60 || true
+    success "  MaaS Gateway restarted"
+}
+
 recover_rhoai_services() {
     local dash_ns="redhat-ods-applications"
 
@@ -572,6 +608,7 @@ recover_rhoai_services() {
 
     _recover_thanos_secret  || need_dashboard_restart=true
     _recover_model_catalog_db || need_dashboard_restart=true
+    _recover_maas_gateway
 
     if [ "$need_dashboard_restart" = true ]; then
         echo "  Restarting dashboard to apply fixes..."
@@ -640,15 +677,20 @@ _ensure_iam_role() {
           }]
         }' --no-cli-pager &>/dev/null
 
+    local account_id
+    account_id=$(_get_aws_account_id)
+    local role_arn="arn:aws:iam::${account_id}:role/${EB_ROLE_NAME}"
+
     aws iam put-role-policy --role-name "$EB_ROLE_NAME" \
         --policy-name StopEC2Policy \
-        --policy-document '{
-          "Version": "2012-10-17",
-          "Statement": [
-            {"Effect":"Allow","Action":["ec2:DescribeInstances","ec2:StopInstances","ec2:DescribeTags"],"Resource":"*"},
-            {"Effect":"Allow","Action":["ssm:StartAutomationExecution","ssm:GetAutomationExecution"],"Resource":"*"}
+        --policy-document "{
+          \"Version\": \"2012-10-17\",
+          \"Statement\": [
+            {\"Effect\":\"Allow\",\"Action\":[\"ec2:DescribeInstances\",\"ec2:StopInstances\",\"ec2:DescribeTags\"],\"Resource\":\"*\"},
+            {\"Effect\":\"Allow\",\"Action\":[\"ssm:StartAutomationExecution\",\"ssm:GetAutomationExecution\"],\"Resource\":\"*\"},
+            {\"Effect\":\"Allow\",\"Action\":\"iam:PassRole\",\"Resource\":\"${role_arn}\",\"Condition\":{\"StringLikeIfExists\":{\"iam:PassedToService\":\"ssm.amazonaws.com\"}}}
           ]
-        }' --no-cli-pager &>/dev/null
+        }" --no-cli-pager &>/dev/null
 
     sleep 5
     success "IAM role created"

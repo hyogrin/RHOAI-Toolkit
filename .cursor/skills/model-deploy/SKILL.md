@@ -354,6 +354,32 @@ Use `resources_create_or_update` (from openshift) with the NIM InferenceService 
 - Use a specific image tag (e.g., `1.8.3`) — the `latest` tag may have CUDA driver incompatibility
 - Set `NIM_MAX_MODEL_LEN` to prevent KV cache OOM (use `16384` for T4 GPUs)
 
+#### MaaSModelRef Creation (LLMInferenceService Only)
+
+After the `LLMInferenceService` is created and its `spec.router.gateway.refs` includes `maas-default-gateway`, ensure a `MaaSModelRef` CR exists in the same namespace. Without this, MaaS Authorization Policies cannot see the model (Dashboard shows "No models available").
+
+**RHOAI 3.4+ behavior**: The platform may auto-create `MaaSModelRef` when a `LLMInferenceService` with gateway refs is deployed. Always verify it exists in Step 11 and create it if missing.
+
+**MCP Tool**: `resources_create_or_update` (from openshift)
+
+```yaml
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSModelRef
+metadata:
+  name: [deployment-name]
+  namespace: [namespace]
+spec:
+  modelRef:
+    kind: LLMInferenceService
+    name: [deployment-name]
+```
+
+**When to create/verify**: Always for every `LLMInferenceService` deployment that has MaaS gateway refs configured. The `oc apply` is idempotent — safe to apply even if the platform auto-created it.
+
+**When to skip**: Skip for standard `InferenceService` deployments (they do not use MaaS gateway).
+
+**If MCP tools are unavailable**: Use `oc apply` or `kubectl apply` with the YAML above.
+
 **Error Handling**:
 - If namespace not found -> Report error, suggest creating namespace or using `/ds-project-setup`
 - If ServingRuntime not found -> Report error, verify runtime name, suggest `/serving-runtime-config`
@@ -389,7 +415,20 @@ Show deployment progress tracking: Pod Scheduled, Image Pulled, Container Starte
 
 **If rhoai unavailable or returns error**: Extract endpoint from `resources_get` (from openshift) on the InferenceService — the URL is in `.status.url`.
 
-**Report success** showing: model name, runtime, namespace, GPUs, inference endpoint URL, API type (OpenAI-compatible REST), and next steps (`/ai-observability`, `/model-monitor`, `/guardrails-config`).
+**Verify MaaSModelRef (LLMInferenceService only):**
+
+For `LLMInferenceService` deployments with MaaS gateway refs, verify the `MaaSModelRef` exists and is ready:
+
+**MCP Tool**: `resources_get` (from openshift)
+- `apiVersion`: `maas.opendatahub.io/v1alpha1`, `kind`: `MaaSModelRef`, `name`: `[deployment-name]`, `namespace`: `[namespace]`
+
+**If MaaSModelRef does not exist**: Create it now using the YAML from Step 9. This can happen on older RHOAI versions that do not auto-create it.
+
+**If MaaSModelRef exists**: Check `.status.conditions` for `Ready=True` and `.status.phase` for `Ready`. If status is `Failed`, report the error message and suggest checking [deployment-annotations.md](docs/references/deployment-annotations.md#common-issue-no-models-available-in-maas-authorization-policies).
+
+**If MCP tools are unavailable**: Use `oc get maasmodelref [deployment-name] -n [namespace] -o yaml`.
+
+**Report success** showing: model name, runtime, namespace, GPUs, inference endpoint URL, MaaSModelRef status (if applicable), API type (OpenAI-compatible REST), and next steps (`/ai-observability`, `/model-monitor`, `/guardrails-config`).
 
 **Provide test commands** based on runtime:
 - **vLLM (OpenAI-compatible)**: `curl -X POST [endpoint]/v1/completions -H "Content-Type: application/json" -d '{"model":"[model-name]","prompt":"Hello","max_tokens":100}'`
