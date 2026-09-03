@@ -91,6 +91,37 @@ show_status() {
         --filters "Name=tag:Name,Values=${INFRA_ID}-*" \
         --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,Name:Tags[?Key==`Name`].Value|[0],Type:InstanceType}' \
         --output table
+
+    # Cross-check OpenShift node/machine state vs AWS (if oc is available)
+    if oc whoami &>/dev/null 2>&1; then
+        echo ""
+        local mismatches=0
+        while IFS=$'\t' read -r inst_id inst_state inst_type inst_name; do
+            [ -z "$inst_id" ] && continue
+            local machine_name machine_phase node_name node_ready
+            machine_name=$(echo "$inst_name" | sed "s/^${INFRA_ID}-//")
+            machine_phase=$(oc get machines -n openshift-machine-api --no-headers 2>/dev/null \
+                | grep "$machine_name" | awk '{print $2}' | head -1)
+            [ -z "$machine_phase" ] && continue
+
+            if [ "$inst_state" = "stopped" ] && [ "$machine_phase" = "Running" ]; then
+                if [ $mismatches -eq 0 ]; then
+                    warn "State mismatch detected (AWS vs OpenShift):"
+                fi
+                echo -e "  ${RED}$inst_name${NC}"
+                echo -e "    AWS: ${RED}stopped${NC}  |  Machine: ${YELLOW}$machine_phase${NC}"
+                echo -e "    → Run: ${CYAN}$0 start${NC} to start stopped instances"
+                mismatches=$((mismatches + 1))
+            fi
+        done < <(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${INFRA_ID}-*" \
+            --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,Tags[?Key==`Name`].Value|[0]]' \
+            --output text 2>/dev/null)
+
+        if [ $mismatches -eq 0 ]; then
+            success "AWS and OpenShift states are consistent"
+        fi
+    fi
 }
 
 stop_instances() {
@@ -549,6 +580,7 @@ wait_for_cluster() {
             echo ""
             success "All cluster operators are stable"
             recover_rhoai_services
+            _wait_for_gpu_ready
             show_access_info
             return 0
         fi
@@ -559,23 +591,66 @@ wait_for_cluster() {
     echo ""
     warn "Some operators may still be stabilizing"
     recover_rhoai_services
+    _wait_for_gpu_ready
     show_access_info
     return 0
 }
 
 ################################################################################
-# RHOAI post-restart recovery
+# GPU node post-restart recovery
 #
-# Fixes two common issues after cluster restart:
-#
-# 1. Model Catalog DB race condition: model-catalog-postgres re-initializes
-#    but the catalog pod starts first, hitting missing tables (locks_rvn, Context).
-#    Fix: restart pods in correct order — postgres → catalog → dashboard.
-#
-# 2. Thanos proxy secret missing: the observability dashboard needs
-#    monitoring-thanos-proxy-secret to query Prometheus/Thanos metrics.
-#    The secret uses a short-lived token that may expire or get deleted.
-#    Fix: recreate the secret with a fresh long-lived SA token.
+# After EC2 GPU instances restart, the node becomes Ready quickly but NVIDIA
+# driver/device-plugin takes 2-5 minutes to initialize. Until then,
+# nvidia.com/gpu=0 and GPU workloads stay Pending.
+################################################################################
+
+_wait_for_gpu_ready() {
+    local gpu_nodes
+    gpu_nodes=$(oc get nodes -l nvidia.com/gpu.present=true --no-headers 2>/dev/null | awk '{print $1}')
+    [ -z "$gpu_nodes" ] && return 0
+
+    local any_not_ready=false
+    for node in $gpu_nodes; do
+        local gpu_count
+        gpu_count=$(oc get node "$node" -o jsonpath='{.status.allocatable.nvidia\.com/gpu}' 2>/dev/null || echo "0")
+        if [ "$gpu_count" = "0" ] || [ -z "$gpu_count" ]; then
+            any_not_ready=true
+            break
+        fi
+    done
+
+    if [ "$any_not_ready" != "true" ]; then
+        success "GPU node(s) ready with nvidia.com/gpu available"
+        return 0
+    fi
+
+    info "Phase 5/5: Waiting for NVIDIA GPU driver & device plugin (up to 5 min)..."
+    local gpu_wait=0
+    while [ $gpu_wait -lt 300 ]; do
+        local all_ready=true
+        for node in $gpu_nodes; do
+            local node_status gpu_count
+            node_status=$(oc get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+            gpu_count=$(oc get node "$node" -o jsonpath='{.status.allocatable.nvidia\.com/gpu}' 2>/dev/null || echo "0")
+            if [ "$node_status" != "True" ] || [ "$gpu_count" = "0" ] || [ -z "$gpu_count" ]; then
+                all_ready=false
+                printf "\r  GPU node %s: Ready=%s  nvidia.com/gpu=%s (%ds)" "$node" "$node_status" "$gpu_count" "$gpu_wait"
+                break
+            fi
+        done
+
+        if [ "$all_ready" = "true" ]; then
+            echo ""
+            success "GPU node(s) ready with nvidia.com/gpu available"
+            return 0
+        fi
+
+        sleep 15
+        gpu_wait=$((gpu_wait + 15))
+    done
+    echo ""
+    warn "GPU driver/device-plugin may still be initializing. Model pods may take a few more minutes."
+}
 ################################################################################
 
 _wait_for_pod_ready() {
