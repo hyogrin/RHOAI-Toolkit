@@ -429,6 +429,50 @@ install_jobset_operator() {
     print_success "JobSet operator installation complete"
 }
 
+# Install OpenShift Lightspeed Operator
+install_lightspeed_operator() {
+    print_header "Installing OpenShift Lightspeed Operator"
+    
+    local ls_namespace="openshift-lightspeed"
+    
+    # Check if already installed
+    if oc get csv -n "$ls_namespace" 2>/dev/null | grep -q "lightspeed-operator"; then
+        print_success "Lightspeed Operator already installed"
+        return 0
+    fi
+    
+    print_step "Creating openshift-lightspeed namespace..."
+    apply_manifest "$_OPERATORS_LIB_DIR/lib/manifests/operators/lightspeed-namespace.yaml" "Lightspeed namespace"
+    
+    local existing_ogs=$(oc get operatorgroup -n "$ls_namespace" -o name 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$existing_ogs" -eq 0 ]; then
+        print_step "Creating OperatorGroup..."
+        apply_manifest "$_OPERATORS_LIB_DIR/lib/manifests/operators/lightspeed-operatorgroup.yaml" "Lightspeed OperatorGroup"
+    fi
+    
+    print_step "Installing Lightspeed Operator subscription..."
+    apply_manifest "$_OPERATORS_LIB_DIR/lib/manifests/operators/lightspeed-subscription.yaml" "Lightspeed Subscription"
+    
+    print_step "Waiting for Lightspeed operator to be ready..."
+    local timeout=300
+    local elapsed=0
+    while [ $elapsed -lt $timeout ]; do
+        _auto_approve_installplans "lightspeed-operator" "$ls_namespace"
+        if oc get csv -n "$ls_namespace" 2>/dev/null | grep -q "lightspeed-operator.*Succeeded"; then
+            break
+        fi
+        echo "Waiting for Lightspeed operator... (${elapsed}s elapsed)"
+        sleep 10
+        elapsed=$((elapsed + 10))
+    done
+    if [ $elapsed -ge $timeout ]; then
+        print_warning "Lightspeed operator not ready yet (continuing anyway)"
+        return 1
+    fi
+    
+    print_success "Lightspeed operator installation complete"
+}
+
 # Wait for Authorino service to be created
 wait_for_authorino_service() {
     print_step "Waiting for Kuadrant components to be ready..."

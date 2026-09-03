@@ -71,7 +71,110 @@ _mcp_ensure_namespace() {
         openshift.io/display-name="MCP Servers" --overwrite 2>/dev/null || true
 }
 
+_mcp_create_custom_settings() {
+    if oc get configmap searxng-custom-settings -n "$MCP_NS" &>/dev/null 2>&1; then
+        print_info "SearXNG custom settings ConfigMap already exists [SKIP]"
+        return 0
+    fi
+
+    print_step "Creating SearXNG custom settings ConfigMap..."
+
+    local google_cse_block=""
+    if [ -n "${SEARXNG_GOOGLE_CSE_CX:-}" ]; then
+        google_cse_block="
+      - name: google cse
+        engine: google_cse
+        shortcut: goc
+        cx: \"${SEARXNG_GOOGLE_CSE_CX}\"
+        weight: 3.0
+        disabled: false
+        inactive: false"
+    fi
+
+    cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searxng-custom-settings
+  namespace: ${MCP_NS}
+  labels:
+    app: mcp-searxng
+    app.kubernetes.io/managed-by: rhoai-toolkit
+data:
+  settings.yml: |
+    use_default_settings:
+      engines:
+        keep_only:
+          - google cse
+          - google
+          - bing
+          - duckduckgo
+          - brave
+          - wikipedia
+          - stackoverflow
+          - github
+          - arxiv
+          - pypi
+
+    general:
+      debug: false
+      instance_name: "searxng-mcp"
+
+    search:
+      safe_search: 0
+      autocomplete: ""
+      formats:
+        - html
+        - json
+
+    server:
+      secret_key: "$(openssl rand -hex 32 2>/dev/null || echo changeme)"
+      bind_address: "127.0.0.1"
+      port: 8080
+      limiter: false
+      public_instance: false
+      image_proxy: false
+      method: "GET"
+
+    outgoing:
+      request_timeout: 10.0
+      max_request_timeout: 30.0
+      useragent_suffix: ""
+      pool_connections: 20
+      pool_maxsize: 20
+
+    engines:${google_cse_block}
+      - name: google
+        engine: google
+        weight: 2.5
+        disabled: false
+        inactive: false
+      - name: bing
+        weight: 2.0
+        disabled: false
+      - name: brave
+        weight: 1.5
+        disabled: false
+      - name: duckduckgo
+        weight: 1.0
+        disabled: false
+      - name: wikipedia
+        disabled: false
+      - name: stackoverflow
+        disabled: false
+      - name: github
+        disabled: false
+EOF
+    print_success "SearXNG custom settings ConfigMap created"
+    if [ -n "${SEARXNG_GOOGLE_CSE_CX:-}" ]; then
+        print_info "Google CSE enabled (cx: ${SEARXNG_GOOGLE_CSE_CX})"
+    else
+        print_info "Google CSE not configured (set SEARXNG_GOOGLE_CSE_CX to enable)"
+    fi
+}
+
 _mcp_deploy_searxng_pod() {
+    _mcp_create_custom_settings
     oc apply -f "$ROOT_DIR/lib/manifests/mcp/searxng.yaml"
     oc wait --for=condition=ready pod -l app=mcp-searxng -n "$MCP_NS" --timeout=120s 2>/dev/null \
         && print_success "SearXNG MCP server is running" \
@@ -352,12 +455,17 @@ _main() {
         case $1 in
             --direct)   mode="direct"; shift ;;
             --gateway)  mode="gateway"; shift ;;
+            --google-cse-cx)
+                export SEARXNG_GOOGLE_CSE_CX="$2"; shift 2 ;;
+            --google-cse-cx=*)
+                export SEARXNG_GOOGLE_CSE_CX="${1#*=}"; shift ;;
             -h|--help)
-                echo "Usage: $(basename "$0") [--direct|--gateway]"
+                echo "Usage: $(basename "$0") [--direct|--gateway] [--google-cse-cx CX_ID]"
                 echo ""
-                echo "  --direct    Deploy with OpenShift Route (no MaaS dependency)"
-                echo "  --gateway   Deploy through MaaS gateway (requires RHCL)"
-                echo "  (no args)   Interactive prompt"
+                echo "  --direct              Deploy with OpenShift Route (no MaaS dependency)"
+                echo "  --gateway             Deploy through MaaS gateway (requires RHCL)"
+                echo "  --google-cse-cx CX    Google Custom Search Engine ID for API-based search"
+                echo "  (no args)             Interactive prompt"
                 exit 0
                 ;;
             *) print_error "Unknown option: $1"; exit 1 ;;

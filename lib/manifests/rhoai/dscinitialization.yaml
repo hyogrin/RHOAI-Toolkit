@@ -1,8 +1,18 @@
-# DSCInitialization for RHOAI 3.4
-# Controls applications namespace, monitoring, and trusted CA bundle.
+# DSCInitialization for RHOAI 3.5
+# Controls applications namespace, monitoring (observability stack), and trusted CA bundle.
 # Applied before DataScienceCluster to ensure operator reconciles correctly.
+#
+# The metrics section is REQUIRED for the Observe & Monitor Dashboard to work.
+# Without storage.size and storage.retention, the operator treats metrics as
+# "not configured" and will not deploy Prometheus, Thanos Querier, or the
+# cluster-prometheus-datasource that the PersesDashboards reference.
+#
+# Prerequisites (must be installed before applying this):
+#   - Cluster Observability Operator (COO)
+#   - Red Hat build of OpenTelemetry
+#   - Tempo Operator
 ---
-apiVersion: dscinitialization.opendatahub.io/v1
+apiVersion: dscinitialization.opendatahub.io/v2
 kind: DSCInitialization
 metadata:
   name: default-dsci
@@ -11,6 +21,17 @@ spec:
   monitoring:
     managementState: Managed
     namespace: redhat-ods-monitoring
+    alerting: {}
+    metrics:
+      replicas: 1
+      storage:
+        size: 5Gi
+        retention: 90d
+    traces:
+      sampleRatio: '0.1'
+      storage:
+        backend: pv
+        retention: 2160h
   trustedCABundle:
     managementState: Managed
     customCABundle: ""

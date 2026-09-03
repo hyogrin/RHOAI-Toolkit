@@ -22,10 +22,16 @@ spec:
         command:
         - sh
         - -c
-        - cp -a /etc/searxng/. /config/
+        - |
+          cp -a /etc/searxng/. /config/
+          if [ -f /custom-settings/settings.yml ]; then
+            cp /custom-settings/settings.yml /config/settings.yml
+          fi
         volumeMounts:
         - name: searxng-config
           mountPath: /config
+        - name: custom-settings
+          mountPath: /custom-settings
       containers:
       - name: searxng
         image: dandehoon/searxng-mcp:latest
@@ -70,6 +76,10 @@ spec:
       volumes:
       - name: searxng-config
         emptyDir: {}
+      - name: custom-settings
+        configMap:
+          name: searxng-custom-settings
+          optional: true
 ---
 apiVersion: v1
 kind: Service
@@ -85,6 +95,11 @@ spec:
   - port: 8000
     protocol: TCP
     targetPort: 8000
+    name: mcp
+  - port: 8888
+    protocol: TCP
+    targetPort: 8080
+    name: searxng-ui
 ---
 apiVersion: route.openshift.io/v1
 kind: Route

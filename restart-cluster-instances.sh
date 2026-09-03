@@ -124,17 +124,178 @@ start_instances() {
         return 0
     fi
 
-    local count
-    count=$(echo "$ids" | wc -w | tr -d ' ')
-    info "Starting $count instances..."
-
+    # Separate GPU and non-GPU instances
+    local gpu_ids="" non_gpu_ids=""
+    local instance_info
     # shellcheck disable=SC2086
-    aws ec2 start-instances --instance-ids $ids --output text > /dev/null
+    instance_info=$(aws ec2 describe-instances \
+        --instance-ids $ids \
+        --query 'Reservations[].Instances[].[InstanceId,InstanceType]' \
+        --output text)
 
-    info "Waiting for all instances to reach 'running' state..."
-    # shellcheck disable=SC2086
-    aws ec2 wait instance-running --instance-ids $ids
-    success "All $count instances started"
+    while read -r inst_id inst_type; do
+        [ -z "$inst_id" ] && continue
+        if echo "$inst_type" | grep -qE '^(g[0-9]|p[0-9]|dl[0-9])'; then
+            gpu_ids="$gpu_ids $inst_id"
+        else
+            non_gpu_ids="$non_gpu_ids $inst_id"
+        fi
+    done <<< "$instance_info"
+
+    non_gpu_ids=$(echo "$non_gpu_ids" | xargs)
+    gpu_ids=$(echo "$gpu_ids" | xargs)
+
+    # Start non-GPU instances first
+    if [ -n "$non_gpu_ids" ]; then
+        local count
+        count=$(echo "$non_gpu_ids" | wc -w | tr -d ' ')
+        info "Starting $count non-GPU instances..."
+        # shellcheck disable=SC2086
+        aws ec2 start-instances --instance-ids $non_gpu_ids --output text > /dev/null
+        info "Waiting for non-GPU instances to reach 'running' state..."
+        # shellcheck disable=SC2086
+        aws ec2 wait instance-running --instance-ids $non_gpu_ids
+        success "All $count non-GPU instances started"
+    fi
+
+    # Start GPU instances with capacity fallback
+    if [ -n "$gpu_ids" ]; then
+        start_gpu_with_fallback $gpu_ids
+    fi
+}
+
+GPU_NEEDS_RECREATION=false
+GPU_FAILED_AZ=""
+
+start_gpu_with_fallback() {
+    local gpu_ids="$*"
+
+    info "Starting GPU instance(s)..."
+
+    for gpu_id in $gpu_ids; do
+        if aws ec2 start-instances --instance-ids "$gpu_id" --output text > /dev/null 2>&1; then
+            aws ec2 wait instance-running --instance-ids "$gpu_id" 2>/dev/null
+            success "GPU instance $gpu_id started"
+            return 0
+        fi
+
+        warn "GPU instance $gpu_id failed to start (InsufficientInstanceCapacity)"
+        info "Will recreate GPU node in a different AZ after cluster is ready..."
+
+        local gpu_az
+        gpu_az=$(aws ec2 describe-instances --instance-ids "$gpu_id" \
+            --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' \
+            --output text 2>/dev/null || echo "")
+        GPU_FAILED_AZ="$gpu_az"
+        GPU_NEEDS_RECREATION=true
+    done
+}
+
+recreate_gpu_machineset() {
+    if [ "${GPU_NEEDS_RECREATION:-false}" != "true" ]; then
+        return 0
+    fi
+
+    info "Recreating GPU node in an available AZ..."
+
+    local failed_az="${GPU_FAILED_AZ:-}"
+    local azs=("us-east-2a" "us-east-2b" "us-east-2c")
+
+    # Get VPC ID from a running master
+    local vpc_id
+    vpc_id=$(aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=${INFRA_ID}-master-*" "Name=instance-state-name,Values=running" \
+        --query 'Reservations[0].Instances[0].VpcId' --output text 2>/dev/null)
+
+    local subnet_map
+    subnet_map=$(aws ec2 describe-subnets \
+        --filters "Name=vpc-id,Values=$vpc_id" "Name=map-public-ip-on-launch,Values=false" \
+        --query 'Subnets[*].[AvailabilityZone,SubnetId]' --output text)
+
+    # Find current GPU MachineSet
+    local current_ms
+    current_ms=$(oc get machineset -n openshift-machine-api --no-headers 2>/dev/null \
+        | grep "gpu-worker" | awk '{print $1}' | head -1)
+
+    if [ -z "$current_ms" ]; then
+        warn "No GPU MachineSet found — cannot recreate"
+        return 1
+    fi
+
+    # Scale down the current (failed AZ) MachineSet
+    info "Scaling down current GPU MachineSet: $current_ms"
+    oc scale machineset "$current_ms" --replicas=0 -n openshift-machine-api 2>/dev/null || true
+
+    # Try each AZ (skip the failed one)
+    for az in "${azs[@]}"; do
+        [ "$az" = "$failed_az" ] && continue
+
+        local subnet_id
+        subnet_id=$(echo "$subnet_map" | grep "$az" | awk '{print $2}' | head -1)
+        if [ -z "$subnet_id" ]; then
+            continue
+        fi
+
+        local new_ms_name="${INFRA_ID}-gpu-worker-g6e.4xlarge-${az}"
+
+        # Check if MachineSet already exists for this AZ
+        if oc get machineset "$new_ms_name" -n openshift-machine-api &>/dev/null 2>&1; then
+            info "MachineSet $new_ms_name exists, scaling to 1..."
+            oc scale machineset "$new_ms_name" --replicas=1 -n openshift-machine-api
+        else
+            info "Creating GPU MachineSet in $az (subnet: $subnet_id)..."
+            oc get machineset "$current_ms" -n openshift-machine-api -o json | \
+                python3 -c "
+import json, sys
+ms = json.load(sys.stdin)
+az = '$az'
+subnet = '$subnet_id'
+new_name = '$new_ms_name'
+
+ms['metadata']['name'] = new_name
+ms['metadata'].pop('resourceVersion', None)
+ms['metadata'].pop('uid', None)
+ms['metadata'].pop('creationTimestamp', None)
+ms['metadata'].pop('generation', None)
+ms.pop('status', None)
+
+ms['spec']['replicas'] = 1
+ms['spec']['selector']['matchLabels']['machine.openshift.io/cluster-api-machineset'] = new_name
+ms['spec']['template']['metadata']['labels']['machine.openshift.io/cluster-api-machineset'] = new_name
+ms['spec']['template']['spec']['providerSpec']['value']['placement']['availabilityZone'] = az
+ms['spec']['template']['spec']['providerSpec']['value']['subnet'] = {'id': subnet}
+
+print(json.dumps(ms))
+" | oc apply -f -
+        fi
+
+        # Wait for the machine to provision (up to 5 min)
+        info "Waiting for GPU node in $az to provision (up to 5 min)..."
+        local wait_count=0
+        while [ $wait_count -lt 20 ]; do
+            local machine_phase
+            machine_phase=$(oc get machines -n openshift-machine-api --no-headers 2>/dev/null \
+                | grep "gpu.*${az}" | awk '{print $2}' | head -1)
+
+            if [ "$machine_phase" = "Running" ]; then
+                success "GPU node provisioned in $az!"
+                if [ "$current_ms" != "$new_ms_name" ]; then
+                    oc delete machineset "$current_ms" -n openshift-machine-api &>/dev/null || true
+                fi
+                return 0
+            elif [ "$machine_phase" = "Failed" ]; then
+                warn "GPU node failed in $az — trying next AZ..."
+                oc scale machineset "$new_ms_name" --replicas=0 -n openshift-machine-api 2>/dev/null || true
+                break
+            fi
+            sleep 15
+            wait_count=$((wait_count + 1))
+        done
+    done
+
+    warn "Could not create GPU node in any AZ. Manual intervention needed."
+    echo "  Try later: oc scale machineset <gpu-machineset> --replicas=1 -n openshift-machine-api"
+    return 1
 }
 
 show_access_info() {
@@ -380,9 +541,10 @@ wait_for_cluster() {
     info "Waiting for cluster operators to stabilize (up to 5 min)..."
     local op_wait=0
     while [ $op_wait -lt 300 ]; do
-        local degraded progressing
-        degraded=$(oc get co --no-headers --request-timeout=15s 2>/dev/null | awk '$5=="True"' | wc -l | tr -d ' ')
-        progressing=$(oc get co --no-headers --request-timeout=15s 2>/dev/null | awk '$4=="True"' | wc -l | tr -d ' ')
+        local degraded progressing co_output
+        co_output=$(oc get co --no-headers --request-timeout=15s 2>/dev/null || true)
+        degraded=$(echo "$co_output" | awk '$5=="True"' | wc -l | tr -d ' ')
+        progressing=$(echo "$co_output" | awk '$4=="True"' | wc -l | tr -d ' ')
         if [ "$degraded" -eq 0 ] && [ "$progressing" -eq 0 ]; then
             echo ""
             success "All cluster operators are stable"
@@ -504,7 +666,7 @@ _recover_model_catalog_db() {
     fi
 
     local catalog_pods
-    catalog_pods=$(oc get pods -n "$ns" -l app.kubernetes.io/name=model-catalog --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    catalog_pods=$(oc get pods -n "$ns" -l app.kubernetes.io/name=model-catalog --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
     if [ "$catalog_pods" -eq 0 ]; then
         return 0
     fi
@@ -991,6 +1153,7 @@ main() {
             show_status
             echo ""
             wait_for_cluster
+            recreate_gpu_machineset
             ;;
         restart)
             preflight_check || exit 1
@@ -1007,6 +1170,7 @@ main() {
             show_status
             echo ""
             wait_for_cluster
+            recreate_gpu_machineset
             ;;
         status)
             show_status

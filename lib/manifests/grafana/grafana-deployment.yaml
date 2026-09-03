@@ -33,6 +33,13 @@ spec:
               value: "/tmp"
             - name: GF_PATHS_PLUGINS
               value: "/tmp"
+          volumeMounts:
+            - name: datasource-provisioning
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provisioning
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
           resources:
             requests:
               cpu: 100m
@@ -40,6 +47,16 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+      volumes:
+        - name: datasource-provisioning
+          configMap:
+            name: grafana-datasource-provisioning
+        - name: dashboard-provisioning
+          configMap:
+            name: grafana-dashboard-provisioning
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
 ---
 apiVersion: v1
 kind: Service

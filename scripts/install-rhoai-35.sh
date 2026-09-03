@@ -1,27 +1,34 @@
 #!/bin/bash
 ################################################################################
-# RHOAI 3.4 Installation Script
-# Installs Red Hat OpenShift AI 3.4 with all prerequisites
+# RHOAI 3.5 Installation Script
+# Installs Red Hat OpenShift AI 3.5 with all prerequisites
 #
-# Key changes from 3.3:
-#   - MaaS core GA (subscriptions replace tiers, API keys, llm-d)
-#     Sub-features still TP: vLLM runtime, external OIDC, observability, external egress
-#   - NeMo Guardrails now GA
-#   - MLflow Operator officially a managed DSC component
-#   - New Tech Preview: AutoML, AutoRAG, vLLM on MaaS, EvalHub
-#   - llm-d enhancements: Prometheus metrics, simplified scheduler config
-#   - MLServer ServingRuntime now GA
-#   - OCI-compliant storage for model registry
-#   - Workbench images default to Red Hat Python index
+# Key changes from 3.4:
+#   - aigateway: new top-level DSC component, replaces kserve.modelsAsService
+#   - OGX replaces Llama Stack (ogx DSC component, OGXServer API)
+#   - mcplifecycleoperator now a first-class DSC component (was separate install)
+#   - sparkoperator for Feast SparkApplication batch engine
+#   - EvalHub GA (SDK/CLI, per-tenant deployment, must-gather tooling)
+#   - Automated Red Teaming GA (Garak-powered, multilingual, OpenAI Responses API)
+#   - External OIDC authentication for MaaS (enterprise IdP integration)
+#   - Body-based model routing (OpenAI SDK compatible /v1/chat/completions)
+#   - llm-d: flow control GA, inference-aware pod lifecycle, controlled deployment
+#   - Canary rollout for KServe RawDeployment
+#   - GPU Infrastructure dashboard (gpuaas flag)
+#   - Custom role creation UI (roleManagement enabled by default)
+#   - Kueue workload scheduling visibility in workbenches
+#   - Observability dashboards GA (requires COO + OpenTelemetry + Tempo operators)
+#   - KubeRay upgraded to 1.6.x
+#   - New dashboard flags: 22 additional feature flags
 #
-# MaaS TLS changes (3.4):
-#   - Uses OpenShift service-ca for Authorino TLS (NOT cert-manager Certificate)
-#   - Gateway requires annotations: opendatahub.io/managed, authorino-tls-bootstrap
-#   - Dashboard flags: maasAuthPolicies, observabilityDashboard (new)
-#   - Tenant CR auto-created in models-as-a-service namespace
-#   - MaaS CRDs: MaaSSubscription, MaaSAuthPolicy, MaaSModelRef, Tenant, ExternalModel
+# MaaS changes (3.5):
+#   - aigateway.modelsAsAService replaces kserve.modelsAsService
+#   - External OIDC: JWT from enterprise IdP, group claims -> subscriptions
+#   - Body-based routing: model name in request body, path-based still supported
+#   - Unified MaaS governance page (subscriptions + auth policies)
+#   - Self-service subscriptions tab for users
 #
-# Reference: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4
+# Reference: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5
 ################################################################################
 
 set -e
@@ -71,7 +78,7 @@ USER_PASSWORD="openshift"
 print_banner() {
     echo ""
     echo -e "${MAGENTA}╔════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${MAGENTA}║          RHOAI 3.4 Installation Script                         ║${NC}"
+    echo -e "${MAGENTA}║          RHOAI 3.5 Installation Script                         ║${NC}"
     echo -e "${MAGENTA}╚════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -106,13 +113,13 @@ usage() {
     echo "  --skip-node-scaling    Skip automatic worker/GPU node scaling"
     echo "  --no-llmd              Don't configure llm-d Gateway"
     echo "  --enable-vllm-maas     Enable vLLM runtime for MaaS (Technology Preview)"
-    echo "  --enable-observability Enable MaaS observability dashboard (Technology Preview)"
+    echo "  --enable-observability Enable gateway telemetry for MaaS observability"
     echo "  --postgres-connection <url>  External PostgreSQL for MaaS (skips POC DB deployment)"
     echo "                         Format: postgresql://user:pass@host:5432/db?sslmode=require"
     echo "  --skip-maas-db         Skip MaaS PostgreSQL setup entirely"
     echo "  --create-admin-user    Create htpasswd admin user (admin/openshiftai) without prompting"
     echo "  --skip-admin-user      Skip creating the htpasswd admin user"
-    echo "  --channel <channel>    RHOAI channel (e.g., fast-3.x, stable-3.4). If not specified, will prompt."
+    echo "  --channel <channel>    RHOAI channel (e.g., stable-3.x, stable-3.5, eus-3.5). If not specified, will prompt."
     echo "  --domain <domain>      Cluster domain (e.g., cluster.example.com)"
     echo "  --timeout <seconds>    Wait timeout for operators (default: 600)"
     echo ""
@@ -131,9 +138,9 @@ usage() {
     echo ""
     echo "Example:"
     echo "  $0 --domain cluster.example.com"
-    echo "  $0 --channel stable-3.4"
-    echo "  $0 --channel stable-3.4 --enable-vllm-maas"
-    echo "  $0 --channel stable-3.4 --enable-observability"
+    echo "  $0 --channel stable-3.5"
+    echo "  $0 --channel stable-3.x --enable-vllm-maas"
+    echo "  $0 --channel stable-3.5 --enable-observability"
     echo "  $0 --postgres-connection 'postgresql://maas:secret@rds.example.com:5432/maas?sslmode=require'"
     echo "  $0 --setup-users --num-users 10 --user-password 'demo123'"
 }
@@ -226,8 +233,8 @@ select_rhoai_channel() {
 
     if [ -z "$channels_raw" ]; then
         print_warning "Unable to fetch RHOAI channels from cluster"
-        print_info "Using default channel: fast-3.x"
-        RHOAI_CHANNEL="fast-3.x"
+        print_info "Using default channel: stable-3.x"
+        RHOAI_CHANNEL="stable-3.x"
         return 0
     fi
 
@@ -240,8 +247,8 @@ select_rhoai_channel() {
     done < <(echo "$channels_raw" | tr ' ' '\n' | sort -V)
 
     if [ ${#channels[@]} -eq 0 ]; then
-        print_warning "No channels found, using default: fast-3.x"
-        RHOAI_CHANNEL="fast-3.x"
+        print_warning "No channels found, using default: stable-3.x"
+        RHOAI_CHANNEL="stable-3.x"
         return 0
     fi
 
@@ -303,14 +310,15 @@ select_rhoai_channel() {
     fi
 
     echo -e "${CYAN}Channel Types:${NC}"
-    echo "  • fast-3.x   : RHOAI 3.x (latest features, GenAI, MaaS)"
-    echo "  • stable-X.Y : Specific version streams (e.g., stable-3.4)"
+    echo "  • stable-3.x : RHOAI 3.x (latest features, GenAI, MaaS)"
+    echo "  • stable-X.Y : Specific version streams (e.g., stable-3.5)"
+    echo "  • eus-3.5    : Extended Update Support for 3.5"
     echo "  • stable     : Production-ready releases"
     echo ""
 
     local default_idx=1
     for i in "${!channel_map[@]}"; do
-        if [ "${channel_map[$i]}" = "fast-3.x" ]; then
+        if [ "${channel_map[$i]}" = "stable-3.x" ]; then
             default_idx=$((i + 1))
             break
         elif [ "${channel_map[$i]}" = "$default_channel" ]; then
@@ -367,7 +375,7 @@ check_prerequisites() {
     print_info "OpenShift version: $ocp_version"
 
     if [[ "$ocp_version" < "4.19" ]]; then
-        print_error "RHOAI 3.4 requires OpenShift 4.19 or later. Current: $ocp_version"
+        print_error "RHOAI 3.5 requires OpenShift 4.19 or later. Current: $ocp_version"
         exit 1
     fi
 
@@ -894,7 +902,7 @@ restart_kuadrant_operator() {
 }
 
 install_rhcl_operator() {
-    # RHOAI 3.4 MaaS prerequisite (Govern LLM access with Models-as-a-Service, §1.2):
+    # RHOAI 3.5 MaaS prerequisite (Govern LLM access with Models-as-a-Service, §1.2):
     #   "installed the Red Hat Connectivity Link Operator version 1.2 or later
     #    to the openshift-operators namespace and created a Kuadrant custom resource
     #    in the kuadrant-system namespace with ready status."
@@ -915,7 +923,7 @@ install_rhcl_operator() {
     elif oc get csv -n kuadrant-system 2>/dev/null | grep -q "rhcl-operator"; then
         print_info "RHCL Operator already installed in kuadrant-system"
     else
-        # Subscription goes to openshift-operators (per RHOAI 3.4 MaaS docs)
+        # Subscription goes to openshift-operators (per RHOAI 3.5 MaaS docs)
         # openshift-operators already has a default OperatorGroup — no need to create one
         oc apply -f "$ROOT_DIR/lib/manifests/rhcl/rhcl-operator-34.yaml"
 
@@ -995,7 +1003,7 @@ install_rhcl_operator() {
         fi
     done
 
-    # Kuadrant CR goes in kuadrant-system (per RHOAI 3.4 MaaS docs)
+    # Kuadrant CR goes in kuadrant-system (per RHOAI 3.5 MaaS docs)
     oc create namespace kuadrant-system 2>/dev/null || true
 
     print_step "Creating Kuadrant instance in kuadrant-system..."
@@ -1109,9 +1117,9 @@ setup_maas_database() {
 }
 
 configure_maas_tls() {
-    # RHOAI 3.4 MaaS TLS uses OpenShift service-ca (NOT cert-manager)
-    # Reference: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/govern_llm_access_with_models-as-a-service/deploy-and-manage-models-as-a-service_maas#configure-tls-for-maas_maas-deploy
-    print_step "Configuring TLS for Models-as-a-Service (3.4 service-ca method)..."
+    # RHOAI 3.5 MaaS TLS uses OpenShift service-ca (NOT cert-manager)
+    # Reference: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/govern_llm_access_with_models-as-a-service/deploy-and-manage-models-as-a-service_maas#configure-tls-for-maas_maas-deploy
+    print_step "Configuring TLS for Models-as-a-Service (service-ca method)..."
 
     # Step 1: Annotate Authorino service for OpenShift service-ca cert generation
     print_step "Annotating Authorino service for service-ca TLS cert..."
@@ -1411,6 +1419,104 @@ install_coo_operator() {
     print_warning "COO operator not ready after 180s (may still be installing)"
 }
 
+install_opentelemetry_operator() {
+    print_step "Installing Red Hat build of OpenTelemetry..."
+
+    if oc get csv -n openshift-opentelemetry-operator 2>/dev/null | grep -q "opentelemetry.*Succeeded"; then
+        print_info "OpenTelemetry operator already installed"
+        return 0
+    fi
+
+    oc apply -f - <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-opentelemetry-operator
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: opentelemetry-operator-group
+  namespace: openshift-opentelemetry-operator
+spec:
+  upgradeStrategy: Default
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: opentelemetry-product
+  namespace: openshift-opentelemetry-operator
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: opentelemetry-product
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+    print_step "Waiting for OpenTelemetry operator..."
+    local elapsed=0
+    while [ $elapsed -lt 180 ]; do
+        if oc get csv -n openshift-opentelemetry-operator 2>/dev/null | grep -q "opentelemetry.*Succeeded"; then
+            print_success "OpenTelemetry operator installed"
+            return 0
+        fi
+        sleep 10
+        elapsed=$((elapsed + 10))
+    done
+
+    print_warning "OpenTelemetry operator not ready after 180s (may still be installing)"
+}
+
+install_tempo_operator() {
+    print_step "Installing Tempo Operator..."
+
+    if oc get csv -n openshift-tempo-operator 2>/dev/null | grep -q "tempo.*Succeeded"; then
+        print_info "Tempo operator already installed"
+        return 0
+    fi
+
+    oc apply -f - <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-tempo-operator
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: tempo-operator-group
+  namespace: openshift-tempo-operator
+spec:
+  upgradeStrategy: Default
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: tempo-product
+  namespace: openshift-tempo-operator
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: tempo-product
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+    print_step "Waiting for Tempo operator..."
+    local elapsed=0
+    while [ $elapsed -lt 180 ]; do
+        if oc get csv -n openshift-tempo-operator 2>/dev/null | grep -q "tempo.*Succeeded"; then
+            print_success "Tempo operator installed"
+            return 0
+        fi
+        sleep 10
+        elapsed=$((elapsed + 10))
+    done
+
+    print_warning "Tempo operator not ready after 180s (may still be installing)"
+}
+
 setup_observability_uiplugins() {
     print_step "Setting up observability UIPlugins..."
 
@@ -1468,70 +1574,44 @@ EOF
 setup_observability_perses() {
     local mon_ns="redhat-ods-monitoring"
 
+    # In RHOAI 3.5, the operator automatically manages Perses server, datasources,
+    # and dashboards when the DSCI monitoring stack is properly configured (metrics section).
+    # Manual creation of Perses CR or PersesDatasource causes conflicts:
+    #   - Duplicate default PrometheusDatasource (operator's cluster-prometheus-datasource
+    #     vs manually created thanos-querier-datasource)
+    #   - Image mismatch (community vs Red Hat image)
+    #
+    # We only ensure supporting resources that the operator doesn't manage.
+
     if ! oc get crd perses.perses.dev &>/dev/null 2>&1; then
-        print_warning "Perses CRD not found — skipping Perses server setup"
+        print_warning "Perses CRD not found — skipping Perses setup"
         return 0
     fi
 
-    # --- 1. Service Account + RBAC ---
-    oc create sa perses-sa -n "$mon_ns" 2>/dev/null || true
-    oc create clusterrolebinding perses-sa-${mon_ns} \
-        --clusterrole=system:openshift:scc:nonroot-v2 \
-        --serviceaccount=${mon_ns}:perses-sa 2>/dev/null || true
-    oc create clusterrolebinding perses-sa-monitoring-view \
-        --clusterrole=cluster-monitoring-view \
-        --serviceaccount=${mon_ns}:perses-sa 2>/dev/null || true
-
-    # --- 2. Perses Server (with client TLS for Thanos proxy) ---
-    # client.tls enables the Perses proxy to verify Thanos's TLS cert via
-    # the openshift-service-ca.crt ConfigMap (auto-injected by OpenShift).
-    oc apply -f - <<EOF
-apiVersion: perses.dev/v1alpha2
-kind: Perses
-metadata:
-  name: data-science-perses
-  namespace: ${mon_ns}
-spec:
-  serviceAccountName: perses-sa
-  config:
-    database:
-      file:
-        case_sensitive: false
-        extension: yaml
-        folder: /perses
-    datasource:
-      disable_local: false
-      global:
-        disable: false
-      project:
-        disable: false
-    ephemeral_dashboard:
-      enable: true
-      cleanup_interval: 300s
-  client:
-    kubernetesAuth:
-      enable: false
-    tls:
-      enable: true
-      caCert:
-        type: configmap
-        name: openshift-service-ca.crt
-        namespace: ${mon_ns}
-        certPath: service-ca.crt
-EOF
-
-    print_step "Waiting for Perses pod..."
-    local elapsed=0
-    while [ $elapsed -lt 90 ]; do
-        if oc get pods -n "$mon_ns" -l app.kubernetes.io/name=perses --no-headers 2>/dev/null | grep -q Running; then
-            print_success "Perses server running in $mon_ns"
-            break
+    # Clean up legacy manually-created datasource if it exists (conflicts with operator)
+    if oc get persesdatasource thanos-querier-datasource -n "$mon_ns" &>/dev/null 2>&1; then
+        local managed_by
+        managed_by=$(oc get persesdatasource thanos-querier-datasource -n "$mon_ns" \
+            -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null)
+        if [ "$managed_by" = "rhoai-toolkit" ]; then
+            print_step "Removing legacy thanos-querier-datasource (conflicts with operator-managed datasource)..."
+            oc delete persesdatasource thanos-querier-datasource -n "$mon_ns" 2>/dev/null || true
         fi
-        sleep 10
-        elapsed=$((elapsed + 10))
-    done
+    fi
 
-    # --- 3. NetworkPolicy: allow perses-operator + dashboard to reach Perses ---
+    # Clean up legacy Perses resources in redhat-ods-applications (from Kuadrant/MaaS initial setup)
+    # These duplicate the operator-managed resources in redhat-ods-monitoring and cause duplicate tabs
+    local apps_ns="redhat-ods-applications"
+    if oc get persesdashboard dashboard-3-maas-usage-admin -n "$apps_ns" &>/dev/null 2>&1; then
+        print_step "Removing legacy Usage dashboard from $apps_ns (duplicate of operator-managed)..."
+        oc delete persesdashboard dashboard-3-maas-usage-admin -n "$apps_ns" 2>/dev/null || true
+    fi
+    if oc get persesdatasource kuadrant-prometheus-datasource -n "$apps_ns" &>/dev/null 2>&1; then
+        print_step "Removing legacy kuadrant-prometheus-datasource from $apps_ns..."
+        oc delete persesdatasource kuadrant-prometheus-datasource -n "$apps_ns" 2>/dev/null || true
+    fi
+
+    # NetworkPolicy: allow perses-operator + dashboard to reach Perses
     oc apply -f - <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1562,76 +1642,22 @@ spec:
     - Ingress
 EOF
 
-    # --- 4. Service-CA ConfigMap (auto-injected) ---
-    oc apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: openshift-service-ca.crt
-  namespace: ${mon_ns}
-  annotations:
-    service.beta.openshift.io/inject-cabundle: "true"
-data: {}
-EOF
-
-    # --- 5. Thanos proxy auth Secret (SA bearer token, 10-year TTL) ---
-    if ! oc get secret thanos-querier-datasource-secret -n "$mon_ns" &>/dev/null; then
-        local sa_token
-        sa_token=$(oc create token perses-sa -n "$mon_ns" --duration=87600h 2>/dev/null || echo "")
-        if [ -n "$sa_token" ]; then
-            oc apply -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: thanos-querier-datasource-secret
-  namespace: ${mon_ns}
-  labels:
-    app.kubernetes.io/managed-by: rhoai-toolkit
-type: Opaque
-stringData:
-  Authorization: "Bearer ${sa_token}"
-EOF
-            print_info "Created Thanos proxy auth secret"
-        else
-            print_warning "Could not generate SA token — PersesDatasource proxy will fail"
+    # Wait for operator-managed Perses to be ready
+    print_step "Waiting for operator-managed Perses server..."
+    local elapsed=0
+    while [ $elapsed -lt 120 ]; do
+        local perses_avail
+        perses_avail=$(oc get dscinitialization default-dsci \
+            -o jsonpath='{.status.conditions[?(@.type=="PersesAvailable")].status}' 2>/dev/null)
+        if [ "$perses_avail" = "True" ]; then
+            print_success "Operator-managed Perses server ready"
+            return 0
         fi
-    fi
+        sleep 10
+        elapsed=$((elapsed + 10))
+    done
 
-    # --- 6. PersesDatasource (default, connects Perses → Thanos) ---
-    oc apply -f - <<EOF
-apiVersion: perses.dev/v1alpha2
-kind: PersesDatasource
-metadata:
-  name: thanos-querier-datasource
-  namespace: ${mon_ns}
-  labels:
-    app.kubernetes.io/name: thanos-querier-datasource
-    app.kubernetes.io/part-of: data-science-monitoring
-    app.kubernetes.io/managed-by: rhoai-toolkit
-spec:
-  client:
-    tls:
-      enable: true
-      caCert:
-        type: configmap
-        name: openshift-service-ca.crt
-        namespace: ${mon_ns}
-        certPath: service-ca.crt
-  config:
-    default: true
-    display:
-      name: "Thanos Querier Datasource"
-    plugin:
-      kind: PrometheusDatasource
-      spec:
-        proxy:
-          kind: HTTPProxy
-          spec:
-            secret: thanos-querier-datasource-secret
-            url: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
-EOF
-
-    print_success "Observability Perses setup complete (server + datasource + auth)"
+    print_warning "Perses not yet available — check: oc get dscinitialization default-dsci -o yaml"
 }
 
 configure_gateway_telemetry() {
@@ -1675,19 +1701,63 @@ install_rhoai_operator() {
 create_datasciencecluster() {
     print_step "Creating DataScienceCluster..."
 
-    # Apply DSCInitialization first (controls monitoring, trustedCABundle, applications namespace)
+    # Apply DSCInitialization (controls monitoring/observability stack, trustedCABundle, applications namespace)
     if ! oc get dscinitialization default-dsci &>/dev/null; then
         print_step "Applying DSCInitialization..."
         oc apply -f "$ROOT_DIR/lib/manifests/rhoai/dscinitialization.yaml"
         oc wait --for=jsonpath='{.status.phase}'=Ready dscinitialization/default-dsci --timeout=120s 2>/dev/null || true
+    else
+        # Ensure existing DSCI has the observability metrics section configured
+        local metrics_status
+        metrics_status=$(oc get dscinitialization default-dsci \
+            -o jsonpath='{.status.conditions[?(@.type=="MonitoringStackAvailable")].status}' 2>/dev/null)
+        if [ "$metrics_status" != "True" ]; then
+            print_step "Updating DSCInitialization with observability metrics config..."
+            oc apply -f "$ROOT_DIR/lib/manifests/rhoai/dscinitialization.yaml"
+            oc wait --for=jsonpath='{.status.conditions[?(@.type=="MonitoringStackAvailable")].status}'=True \
+                dscinitialization/default-dsci --timeout=180s 2>/dev/null || \
+                print_warning "MonitoringStack may need more time to become available"
+        fi
     fi
 
     if oc get datasciencecluster default-dsc &>/dev/null; then
-        print_info "DataScienceCluster already exists"
-        return 0
-    fi
+        local needs_update=false
 
-    oc apply -f "$ROOT_DIR/lib/manifests/rhoai/datasciencecluster-v3-34.yaml"
+        # Check for deprecated kserve.modelsAsService (should use aigateway.modelsAsAService)
+        local has_deprecated_maas
+        has_deprecated_maas=$(oc get datasciencecluster default-dsc \
+            -o jsonpath='{.spec.components.kserve.modelsAsService.managementState}' 2>/dev/null)
+        if [ -n "$has_deprecated_maas" ]; then
+            needs_update=true
+        fi
+
+        # Check if llamastackoperator is Managed (must be Removed for OGX)
+        local llama_state
+        llama_state=$(oc get datasciencecluster default-dsc \
+            -o jsonpath='{.spec.components.llamastackoperator.managementState}' 2>/dev/null)
+        if [ "$llama_state" = "Managed" ]; then
+            print_step "Migrating llamastackoperator -> ogx (mutually exclusive)..."
+            needs_update=true
+        fi
+
+        # Check if OGX is missing or Removed
+        local ogx_state
+        ogx_state=$(oc get datasciencecluster default-dsc \
+            -o jsonpath='{.spec.components.ogx.managementState}' 2>/dev/null)
+        if [ "$ogx_state" != "Managed" ]; then
+            needs_update=true
+        fi
+
+        if [ "$needs_update" = true ]; then
+            print_step "Updating DataScienceCluster to 3.5 spec (aigateway, ogx)..."
+            oc apply -f "$ROOT_DIR/lib/manifests/rhoai/datasciencecluster-v3-35.yaml"
+        else
+            print_info "DataScienceCluster already exists with 3.5 spec"
+            return 0
+        fi
+    else
+        oc apply -f "$ROOT_DIR/lib/manifests/rhoai/datasciencecluster-v3-35.yaml"
+    fi
 
     print_step "Waiting for DataScienceCluster core components..."
     local elapsed=0
@@ -1735,19 +1805,36 @@ enable_dashboard_features() {
         elapsed=$((elapsed + 5))
     done
 
-    # Build dashboard config with all 3.4 MaaS flags
-    # Required flags per https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/govern_llm_access_with_models-as-a-service:
-    #   modelAsService: true          - core MaaS functionality
-    #   genAiStudio: true             - MaaS user-facing features in dashboard
-    #   maasAuthPolicies: true        - MaaS admin features (subscriptions, auth policies)
-    #   vLLMDeploymentOnMaaS: true    - Required for "Publish as MaaS" to appear in deploy wizard
-    #                                   (without it, dashboard hides the non-legacy deployment path)
-    # Developer Preview flags:
-    #   mcpCatalog: true              - MCP Catalog under AI Hub (requires MCP Lifecycle Operator)
-    # Optional TP flags:
-    #   observabilityDashboard: true  - MaaS usage monitoring dashboard (TP)
-    # Single unified patch — always enable all dashboard flags.
-    # merge-patch is additive, so every flag is always present.
+    # Build dashboard config with all 3.5 feature flags (34 total)
+    # Reference: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5
+    #
+    # Flags carried from 3.4 (14):
+    #   disableModelRegistry: false, disableModelCatalog: false, disableKServeMetrics: false,
+    #   disableLMEval: false, disableKueue: false, genAiStudio, modelAsService,
+    #   maasAuthPolicies, vLLMDeploymentOnMaaS, observabilityDashboard, mcpCatalog,
+    #   llmGatewayField, deploymentWizardYAMLViewer, aiAssetCustomEndpoints
+    #
+    # New flags in 3.5 (20):
+    #   roleManagement        - Custom role creation UI (default true in 3.5)
+    #   gpuaas                - GPU Infrastructure dashboard
+    #   agentOps              - Agent operations management
+    #   agentsCatalog         - Agent templates catalog in AI Hub
+    #   agentConfigManagement - Agent configuration management UI
+    #   automl                - AutoML experiments (requires AI Pipelines)
+    #   autorag               - AutoRAG experiments (requires AI Pipelines)
+    #   connectionTest        - Connection testing in data connection setup
+    #   externalModels        - External model endpoints in Gen AI Studio
+    #   externalVectorStores  - External vector store connections
+    #   featureStoreAdmin     - Feature Store admin capabilities
+    #   genAiTracing          - Gen AI tracing with MLflow
+    #   globalProjectPrompts  - Global project-level prompt management
+    #   guardrails            - Guardrails configuration in model deployment
+    #   llmdTemplates         - llm-d templates in deploy wizard
+    #   mcpRegistry           - MCP server registry (replaces mcpCatalog scope)
+    #   projectRBAC           - Per-project RBAC management UI
+    #   promptManagement      - Prompt management in Gen AI Studio
+    #   toolCalling           - Tool calling configuration for models
+    #   trainingJobs          - Training job management UI
     local patch_json='{
         "spec": {
             "dashboardConfig": {
@@ -1764,7 +1851,27 @@ enable_dashboard_features() {
                 "mcpCatalog": true,
                 "llmGatewayField": true,
                 "deploymentWizardYAMLViewer": true,
-                "aiAssetCustomEndpoints": true
+                "aiAssetCustomEndpoints": true,
+                "roleManagement": true,
+                "gpuaas": true,
+                "agentOps": true,
+                "agentsCatalog": true,
+                "agentConfigManagement": true,
+                "automl": true,
+                "autorag": true,
+                "connectionTest": true,
+                "externalModels": true,
+                "externalVectorStores": true,
+                "featureStoreAdmin": true,
+                "genAiTracing": true,
+                "globalProjectPrompts": true,
+                "guardrails": true,
+                "llmdTemplates": true,
+                "mcpRegistry": true,
+                "projectRBAC": true,
+                "promptManagement": true,
+                "toolCalling": true,
+                "trainingJobs": true
             }
         }
     }'
@@ -1774,39 +1881,26 @@ enable_dashboard_features() {
         --type=merge \
         -p "$patch_json" 2>/dev/null || print_warning "Could not patch dashboard config yet"
 
-    print_success "Dashboard features enabled (all 3.4 flags)"
+    print_success "Dashboard features enabled (34 flags for RHOAI 3.5)"
 }
 
 install_mcp_lifecycle_operator() {
-    print_step "Installing MCP Lifecycle Operator (Developer Preview)..."
-
+    # In RHOAI 3.5, mcplifecycleoperator is a first-class DSC component.
+    # No separate installation needed — the DSC manages it automatically.
     if oc get crd mcpservers.mcp.x-k8s.io &>/dev/null; then
-        print_success "MCP Lifecycle Operator already installed [SKIP]"
-        return 0
-    fi
-
-    local MCP_OPERATOR_URL="https://github.com/kubernetes-sigs/mcp-lifecycle-operator/releases/latest/download/install.yaml"
-
-    print_step "Deploying MCP Lifecycle Operator from kubernetes-sigs..."
-    if kubectl apply -f "$MCP_OPERATOR_URL" &>/dev/null; then
-        print_success "MCP Lifecycle Operator deployed"
+        print_success "MCP Lifecycle Operator managed by DSC [OK]"
     else
-        print_warning "Could not install MCP Lifecycle Operator — MCP Catalog will not appear in AI Hub"
-        return 1
-    fi
-
-    local elapsed=0
-    while [ $elapsed -lt 120 ]; do
-        if oc get pods -n mcp-lifecycle-operator-system 2>/dev/null | grep -q "1/1.*Running"; then
-            print_success "MCP Lifecycle Operator is running"
-            break
-        fi
-        sleep 5
-        elapsed=$((elapsed + 5))
-    done
-
-    if [ $elapsed -ge 120 ]; then
-        print_warning "MCP Lifecycle Operator not ready yet — check: oc get pods -n mcp-lifecycle-operator-system"
+        print_info "MCP Lifecycle Operator will be deployed by DSC (mcplifecycleoperator: Managed)"
+        local elapsed=0
+        while [ $elapsed -lt 120 ]; do
+            if oc get crd mcpservers.mcp.x-k8s.io &>/dev/null; then
+                print_success "MCP Lifecycle Operator CRD ready"
+                return 0
+            fi
+            sleep 5
+            elapsed=$((elapsed + 5))
+        done
+        print_warning "MCP Lifecycle Operator CRD not yet available — DSC may still be reconciling"
     fi
 }
 
@@ -1872,7 +1966,7 @@ create_inference_gateway() {
     print_step "Applying gateway resource overrides (2Gi memory limit)..."
     oc apply -f "$ROOT_DIR/lib/manifests/rhcl/gateway-resources.yaml"
 
-    # MaaS Gateway - MUST have both annotations for MaaS controller to work in 3.4:
+    # MaaS Gateway - MUST have both annotations for MaaS controller to work:
     #   opendatahub.io/managed: "false" - lets MaaS controller manage auth policies
     #   security.opendatahub.io/authorino-tls-bootstrap: "true" - enables TLS to Authorino
     print_step "Creating maas-default-gateway with MaaS annotations..."
@@ -2516,11 +2610,10 @@ setup_demo_users() {
 print_summary() {
     echo ""
     echo -e "${GREEN}╔════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║          RHOAI 3.4 Installation Complete!                      ║${NC}"
+    echo -e "${GREEN}║          RHOAI 3.5 Installation Complete!                      ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    # RHOAI 3.4 dashboard URL changed to rh-ai (data-science-gateway auto-redirects)
     local dashboard_url=$(oc get route -n redhat-ods-applications -o jsonpath='{.items[?(@.metadata.name=="rh-ai")].spec.host}' 2>/dev/null)
     if [ -z "$dashboard_url" ]; then
         dashboard_url=$(oc get route -n redhat-ods-applications -o jsonpath='{.items[?(@.metadata.name=="data-science-gateway")].spec.host}' 2>/dev/null)
@@ -2559,19 +2652,25 @@ print_summary() {
     fi
 
     echo ""
-    echo -e "${GREEN}What's New in 3.4:${NC}"
-    echo "  • MaaS core platform now GA (subscriptions replace tiers, API keys, llm-d)"
-    echo "    Sub-features still TP: vLLM runtime, external OIDC, observability, external model egress"
-    echo "  • MaaS uses OpenShift service-ca for TLS (NOT cert-manager)"
-    echo "  • NeMo Guardrails now Generally Available"
-    echo "  • MLflow Operator is officially a managed DSC component"
-    echo "  • AutoML and AutoRAG available as Technology Preview"
-    echo "  • llm-d: Prometheus metrics, simplified scheduler config"
-    echo "  • MLServer ServingRuntime now GA (scikit-learn, XGBoost, LightGBM, ONNX)"
-    echo "  • OCI-compliant storage for Model Registry"
+    echo -e "${GREEN}What's New in 3.5:${NC}"
+    echo "  • aigateway: new DSC component replaces kserve.modelsAsService"
+    echo "    - External OIDC auth for MaaS (enterprise IdP integration)"
+    echo "    - Body-based model routing (OpenAI SDK /v1/chat/completions compatible)"
+    echo "    - Self-service subscriptions, unified MaaS governance page"
+    echo "  • OGX replaces Llama Stack (OGXServer API, Responses API GA)"
+    echo "  • EvalHub GA: SDK/CLI, per-tenant deployment, must-gather tooling"
+    echo "  • Automated Red Teaming GA (Garak-powered, multilingual)"
+    echo "  • llm-d: flow control GA, inference-aware pod lifecycle, controlled deployment"
+    echo "  • Canary rollout for KServe RawDeployment"
+    echo "  • GPU Infrastructure dashboard (gpuaas flag)"
+    echo "  • Custom role creation UI (roleManagement)"
+    echo "  • MCP Lifecycle Operator now a DSC component (no separate install)"
+    echo "  • sparkoperator for Feast SparkApplication batch engine"
+    echo "  • KubeRay upgraded to 1.6.x"
+    echo "  • Kueue workload scheduling visible in workbenches"
+    echo "  • Observability dashboards installed by default for llm-d"
     echo ""
 
-    # Show PostgreSQL info
     if oc get secret maas-db-config -n redhat-ods-applications &>/dev/null; then
         if oc get deployment postgres -n redhat-ods-applications &>/dev/null; then
             echo -e "${YELLOW}PostgreSQL:${NC} POC instance in redhat-ods-applications (NOT for production)"
@@ -2582,7 +2681,7 @@ print_summary() {
         echo ""
     fi
 
-    echo -e "${YELLOW}MaaS Next Steps (new subscription model in 3.4):${NC}"
+    echo -e "${YELLOW}MaaS Next Steps:${NC}"
     echo "  1. Access dashboard > Settings > verify MaaS is active"
     echo "  2. Deploy a model and publish to MaaS (creates MaaSModelRef)"
     echo "  3. Create a MaaS Subscription (dashboard Settings > Subscriptions)"
@@ -2594,11 +2693,10 @@ print_summary() {
         echo "  • vLLM on MaaS is enabled (TP) - deploy models via MaaS with vLLM runtime"
     fi
     if [ "$ENABLE_OBSERVABILITY" = true ]; then
-        echo "  • MaaS observability dashboard is enabled (TP)"
+        echo "  • MaaS observability dashboard is enabled"
     fi
     echo ""
 
-    # MCP Server status
     if oc get deploy mcp-searxng -n mcp-servers --no-headers 2>/dev/null | grep -q "1/1"; then
         local mcp_mode="unknown"
         if oc get route mcp-searxng -n mcp-servers &>/dev/null 2>&1; then
@@ -2624,8 +2722,12 @@ print_summary() {
     echo "  oc get crd | grep maas.opendatahub.io"
     echo "  oc get tenant -n models-as-a-service"
     echo "  oc get gateway maas-default-gateway -n openshift-ingress"
+    echo "  oc get ogxserver -A"
     echo "  oc get deploy -n mcp-servers"
     echo "  oc get authorino authorino -n kuadrant-system -o jsonpath='{.spec.listener.tls}'"
+    echo ""
+    echo -e "${BLUE}Documentation:${NC}"
+    echo "  https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5"
     echo ""
 }
 
@@ -2789,12 +2891,11 @@ main() {
     create_datasciencecluster
 
     enable_dashboard_features
-    install_mcp_lifecycle_operator
     deploy_mcp_searxng
     create_hardware_profile
     create_mlflow_server
 
-    # MaaS DB + TLS setup (3.4) - must run after RHCL and gateway are created
+    # MaaS DB + TLS setup - must run after RHCL and gateway are created
     # DB secret must exist BEFORE modelsAsService becomes Managed (or restart maas-api after)
     if [ "$SKIP_RHCL" = false ] && [ "$SKIP_MAAS" = false ]; then
         if [ "$SKIP_MAAS_DB" = false ]; then
@@ -2813,7 +2914,12 @@ main() {
         verify_maas_deployment
     fi
 
-    # Observability stack — always install COO + UIPlugins + Perses + Grafana + Thanos proxy
+    # Observability stack — install prerequisite operators + COO + UIPlugins + Perses + Grafana
+    # OpenTelemetry and Tempo are REQUIRED for the DSCI monitoring stack (metrics, traces).
+    # Without them, MonitoringStackAvailable stays False and the Observe & Monitor
+    # Dashboard in RHOAI will show "No datasource found for cluster-prometheus-datasource".
+    install_opentelemetry_operator
+    install_tempo_operator
     install_coo_operator
     setup_observability_uiplugins
     setup_observability_perses

@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 source "$REPO_ROOT/lib/utils/colors.sh" 2>/dev/null || true
+source "$REPO_ROOT/lib/utils/common.sh" 2>/dev/null || true
+source "$REPO_ROOT/lib/functions/operators.sh" 2>/dev/null || true
 
 DEMO_NAMESPACE="${DEMO_NAMESPACE:-lightspeed-demo}"
 MCP_SERVER_NAMESPACE="${MCP_SERVER_NAMESPACE:-0-test}"
@@ -34,8 +36,8 @@ check_prerequisites() {
     fi
 
     if ! oc get csv -n openshift-lightspeed 2>/dev/null | grep -q lightspeed-operator; then
-        echo_error "OpenShift Lightspeed operator not found. Install it first."
-        exit 1
+        echo_warn "OpenShift Lightspeed operator not found. Installing..."
+        install_lightspeed_operator
     fi
 
     if ! oc get olsconfig cluster &>/dev/null; then
@@ -48,18 +50,36 @@ check_prerequisites() {
 detect_model() {
     echo_info "Detecting available model for Lightspeed..."
 
-    local isvc_name isvc_ns isvc_url
+    local isvc_name isvc_ns isvc_url model_uri
+
+    # Prefer LLMInferenceService (llm-d) — these are chat/instruct models
+    isvc_name=$(oc get llminferenceservice --all-namespaces -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    isvc_ns=$(oc get llminferenceservice --all-namespaces -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || true)
+
+    if [[ -n "$isvc_name" ]]; then
+        isvc_url=$(oc get llminferenceservice "$isvc_name" -n "$isvc_ns" -o jsonpath='{.status.url}' 2>/dev/null)
+        model_uri=$(oc get llminferenceservice "$isvc_name" -n "$isvc_ns" -o jsonpath='{.spec.model.uri}' 2>/dev/null)
+        # Extract HuggingFace model ID from uri (e.g. hf://RedHatAI/gemma-4-12B-it → RedHatAI/gemma-4-12B-it)
+        local model_id="${model_uri#hf://}"
+        export OLS_MODEL_NAME="$model_id"
+        export OLS_MODEL_URL="${isvc_url}/v1"
+        export OLS_PROVIDER_NAME="${isvc_name}"
+        export OLS_CREDENTIALS_SECRET="ols-model-credentials"
+        echo_success "Using llm-d model: $OLS_MODEL_NAME ($OLS_MODEL_URL)"
+        return
+    fi
+
+    # Fallback to InferenceService (vLLM/KServe)
     isvc_name=$(oc get inferenceservice --all-namespaces -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
     isvc_ns=$(oc get inferenceservice --all-namespaces -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || true)
 
     if [[ -z "$isvc_name" ]]; then
-        echo_error "No InferenceService found. Deploy a model first."
+        echo_error "No LLMInferenceService or InferenceService found. Deploy a model first."
         exit 1
     fi
 
     isvc_url=$(oc get inferenceservice "$isvc_name" -n "$isvc_ns" -o jsonpath='{.status.url}' 2>/dev/null)
 
-    # Query model name from vLLM /v1/models endpoint
     local model_id
     model_id=$(curl -sk "${isvc_url}/v1/models" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || echo "$isvc_name")
 
