@@ -358,7 +358,7 @@ echo ""
 # Step 3. MaaS Gateway 생성
 #         AIGateway가 활성화된 후 maas-default-gateway가 필요
 ###############################################################################
-info "=== Step 3/5: MaaS Gateway 생성 ==="
+info "=== Step 3/6: MaaS Gateway 생성 ==="
 
 CLUSTER_DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')
 
@@ -420,7 +420,7 @@ echo ""
 ###############################################################################
 # Step 4. OdhDashboardConfig 패치 — Dashboard 메뉴 전체 활성화
 ###############################################################################
-info "=== Step 4/5: Dashboard 메뉴 전체 활성화 ==="
+info "=== Step 4/6: Dashboard 메뉴 전체 활성화 ==="
 
 WAIT=0
 while ! oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications &>/dev/null; do
@@ -479,7 +479,7 @@ echo ""
 ###############################################################################
 # Step 5. Dashboard 재시작 + 결과 확인
 ###############################################################################
-info "=== Step 5/5: Dashboard 재시작 & 결과 확인 ==="
+info "=== Step 5/6: Dashboard 재시작 ==="
 oc rollout restart deployment/rhods-dashboard -n redhat-ods-applications 2>/dev/null || true
 info "재시작 중 (1-2분 소요)..."
 sleep 10
@@ -488,7 +488,10 @@ oc rollout status deployment/rhods-dashboard -n redhat-ods-applications --timeou
 success "Dashboard 재시작 완료"
 echo ""
 
-# --- 결과 출력 ---
+###############################################################################
+# Step 6. 결과 확인
+###############################################################################
+info "=== Step 6/6: 결과 확인 ==="
 info "DSC 주요 컴포넌트:"
 for comp in MLflowOperatorReady OGXReady AIGatewayReady KserveReady TrustyAIReady AIPipelinesReady DashboardReady WorkbenchesReady ModelsAsAServiceReady; do
     STATUS=$(oc get datasciencecluster default-dsc -o jsonpath="{.status.conditions[?(@.type==\"${comp}\")].status}" 2>/dev/null)

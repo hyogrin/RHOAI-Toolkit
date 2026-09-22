@@ -148,6 +148,47 @@ wait_for_dashboard_config() {
     return 1
 }
 
+ensure_dsci_observability() {
+    # DSCI monitoring.metrics.storage가 비어있으면 Perses/MonitoringStack이 동작하지 않음
+    # → Observe & Monitor 대시보드가 "No datasource found" 에러를 표시
+    local metrics_size
+    metrics_size=$(oc get dscinitialization default-dsci \
+        -o jsonpath='{.spec.monitoring.metrics.storage.size}' 2>/dev/null)
+    if [ -n "$metrics_size" ]; then
+        print_info "DSCI metrics already configured (storage: $metrics_size) [SKIP]"
+        return 0
+    fi
+
+    print_step "DSCI Observability 설정 (metrics/traces storage)..."
+    if oc patch dscinitialization default-dsci --type=merge -p '{
+      "spec": {
+        "monitoring": {
+          "managementState": "Managed",
+          "namespace": "redhat-ods-monitoring",
+          "alerting": {},
+          "metrics": {
+            "replicas": 1,
+            "storage": {
+              "size": "5Gi",
+              "retention": "90d"
+            }
+          },
+          "traces": {
+            "sampleRatio": "0.1",
+            "storage": {
+              "backend": "pv",
+              "retention": "2160h"
+            }
+          }
+        }
+      }
+    }' 2>/dev/null; then
+        print_success "DSCI metrics/traces 설정 완료"
+    else
+        print_warning "DSCI 패치 실패 — 수동으로 설정이 필요할 수 있습니다"
+    fi
+}
+
 apply_dashboard_features() {
     print_step "Applying 34 dashboard feature flags for RHOAI 3.5..."
 
@@ -330,6 +371,7 @@ main() {
 
     # Apply
     check_connection || exit 1
+    ensure_dsci_observability
     wait_for_dashboard_config || exit 1
     apply_dashboard_features || exit 1
 
