@@ -183,9 +183,15 @@ if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
 
     if [ "$AUTO_YES" = true ]; then
         REPLY="y"
-    else
+    elif [ -t 0 ]; then
+        # 터미널에서 직접 실행 → 사용자 입력 대기
         echo -en "  자동 설치하시겠습니까? [Y/n] "
-        read -r REPLY
+        read -r REPLY </dev/tty
+    else
+        # pipe/비대화형 실행 → 설치하지 않고 안내
+        warn "비대화형 모드: 자동 설치를 건너뜁니다"
+        warn "자동 설치하려면: bash sno-enable-all-features.sh --yes"
+        REPLY="n"
     fi
 
     if [[ "$REPLY" =~ ^[Nn]$ ]]; then
