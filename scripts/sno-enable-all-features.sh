@@ -393,7 +393,6 @@ oc patch odhdashboardconfig odh-dashboard-config \
       "disableTrustyBiasMetrics": false,
       "genAiStudio": true,
       "modelAsService": true,
-      "maasAuthPolicies": true,
       "vLLMDeploymentOnMaaS": true,
       "observabilityDashboard": true,
       "mcpCatalog": true,

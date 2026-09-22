@@ -19,7 +19,7 @@
 #     - EvalHub (disableLMEval: false) — model & agent evaluation toolkit
 #     - Custom role creation UI (roleManagement)
 #     - GenAI Studio / Playground (genAiStudio)
-#     - Model as a Service (modelAsService, maasAuthPolicies, vLLMDeploymentOnMaaS)
+#     - Model as a Service (modelAsService, vLLMDeploymentOnMaaS)
 #     - Model Catalog & Registry (disableModelCatalog, disableModelRegistry: false)
 #     - MCP catalog & registry (mcpCatalog, mcpRegistry)
 #     - llm-d templates (llmdTemplates) — deploy wizard integration
@@ -87,7 +87,6 @@ build_dashboard_patch() {
             "disableTracking": false,
             "genAiStudio": true,
             "modelAsService": true,
-            "maasAuthPolicies": true,
             "vLLMDeploymentOnMaaS": true,
             "observabilityDashboard": true,
             "mcpCatalog": true,
@@ -187,7 +186,6 @@ verify_dashboard_features() {
     _check_flag "$config" "gpuaas"                 "GPU-as-a-Service dashboard"
     _check_flag "$config" "genAiStudio"            "GenAI Studio / Playground"
     _check_flag "$config" "modelAsService"         "Model as a Service (MaaS)"
-    _check_flag "$config" "maasAuthPolicies"       "MaaS auth policies"
     _check_flag "$config" "vLLMDeploymentOnMaaS"   "vLLM deployment on MaaS"
     _check_flag "$config" "observabilityDashboard" "Observability dashboard"
     _check_flag "$config" "guardrails"             "NeMo Guardrails config"
