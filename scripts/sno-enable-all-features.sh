@@ -140,17 +140,20 @@ declare -a MISSING_GREP=()
 declare -a MISSING_IDX=()
 
 for i in "${!OP_NAMES[@]}"; do
-    # RHCL은 -A로 검색 (namespace가 다를 수 있음)
+    FOUND=false
     if [ "${OP_SUB[$i]}" = "rhcl-operator" ]; then
-        if oc get csv -A --no-headers 2>/dev/null | grep -q "rhcl-operator.*Succeeded"; then
-            success "${OP_NAMES[$i]} ✓"
-            continue
+        # RHCL은 AllNamespaces 모드일 수 있으므로 Subscription으로 체크 (빠름)
+        if oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator"; then
+            FOUND=true
         fi
     else
-        if oc get csv -n "${OP_NS[$i]}" 2>/dev/null | grep -q "${OP_GREP[$i]}.*Succeeded"; then
-            success "${OP_NAMES[$i]} ✓"
-            continue
+        if oc get csv -n "${OP_NS[$i]}" --no-headers 2>/dev/null | grep -q "${OP_GREP[$i]}.*Succeeded"; then
+            FOUND=true
         fi
+    fi
+    if $FOUND; then
+        success "${OP_NAMES[$i]} ✓"
+        continue
     fi
     warn "${OP_NAMES[$i]} — 미설치  (용도: ${OP_USE[$i]})"
     MISSING_NAMES+=("${OP_NAMES[$i]}")
@@ -218,10 +221,12 @@ fi
 echo ""
 
 ###############################################################################
-# Step 1. User Workload Monitoring 활성화
-#         GPUaaS Dashboard / Observability가 Prometheus 메트릭을 조회하려면 필수
+# Step 1. User Workload Monitoring + DSCI Observability 설정
+#         GPUaaS Dashboard / Observe & Monitor가 동작하려면:
+#         - User Workload Monitoring 활성화
+#         - DSCI monitoring.metrics/traces 설정 (storage 필수!)
 ###############################################################################
-info "=== Step 1/5: User Workload Monitoring ==="
+info "=== Step 1/6: User Workload Monitoring + DSCI Observability ==="
 
 if oc get configmap cluster-monitoring-config -n openshift-monitoring &>/dev/null 2>&1; then
     EXISTING=$(oc get configmap cluster-monitoring-config -n openshift-monitoring \
@@ -262,13 +267,58 @@ while [ "$(oc get pods -n openshift-user-workload-monitoring --no-headers 2>/dev
     [ $WAIT -ge 60 ] && { warn "Monitoring pods 대기 timeout (계속 진행)"; break; }
     sleep 5; WAIT=$((WAIT + 5))
 done
+
+# DSCI monitoring.metrics/traces 설정 (Observe & Monitor 대시보드 필수)
+# metrics.storage가 비어있으면 Perses/MonitoringStack이 동작하지 않음
+info "DSCI Observability 설정 중..."
+METRICS_CONFIGURED=$(oc get dscinitialization default-dsci \
+  -o jsonpath='{.spec.monitoring.metrics.storage.size}' 2>/dev/null)
+if [ -n "$METRICS_CONFIGURED" ]; then
+    success "DSCI metrics 이미 설정됨 (storage: $METRICS_CONFIGURED) ✓"
+else
+    oc patch dscinitialization default-dsci --type=merge -p '{
+      "spec": {
+        "monitoring": {
+          "managementState": "Managed",
+          "namespace": "redhat-ods-monitoring",
+          "alerting": {},
+          "metrics": {
+            "replicas": 1,
+            "storage": {
+              "size": "5Gi",
+              "retention": "90d"
+            }
+          },
+          "traces": {
+            "sampleRatio": "0.1",
+            "storage": {
+              "backend": "pv",
+              "retention": "2160h"
+            }
+          }
+        }
+      }
+    }'
+    success "DSCI metrics/traces 설정 완료"
+fi
+
+# MonitoringStack 대기
+info "MonitoringStack 프로비저닝 대기 중..."
+WAIT=0
+while [ $WAIT -lt 120 ]; do
+    MON_STATUS=$(oc get dscinitialization default-dsci \
+      -o jsonpath='{.status.conditions[?(@.type=="MonitoringStackAvailable")].status}' 2>/dev/null)
+    [ "$MON_STATUS" = "True" ] && { success "MonitoringStack ✓"; break; }
+    sleep 10; WAIT=$((WAIT + 10))
+done
+[ "$MON_STATUS" != "True" ] && warn "MonitoringStack 아직 준비 중 (계속 진행)"
 echo ""
 
 ###############################################################################
 # Step 2. DSC 패치 — 백엔드 컴포넌트 활성화
 #         mlflowoperator / ogx / aigateway+MaaS / llamastackoperator Removed
 ###############################################################################
-info "=== Step 2/5: DSC 컴포넌트 활성화 ==="
+info "=== Step 2/6: DSC 컴포넌트 활성화 ==="
 
 oc patch datasciencecluster default-dsc --type=merge -p '{
   "spec": {
@@ -453,19 +503,13 @@ done
 echo ""
 info "Operators:"
 for i in "${!OP_NAMES[@]}"; do
+    OP_OK=false
     if [ "${OP_SUB[$i]}" = "rhcl-operator" ]; then
-        if oc get csv -A --no-headers 2>/dev/null | grep -q "rhcl-operator.*Succeeded"; then
-            echo "  ✅ ${OP_NAMES[$i]}"
-        else
-            echo "  ⬚  ${OP_NAMES[$i]}"
-        fi
+        oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator" && OP_OK=true
     else
-        if oc get csv -n "${OP_NS[$i]}" 2>/dev/null | grep -q "${OP_GREP[$i]}.*Succeeded"; then
-            echo "  ✅ ${OP_NAMES[$i]}"
-        else
-            echo "  ⬚  ${OP_NAMES[$i]}"
-        fi
+        oc get csv -n "${OP_NS[$i]}" --no-headers 2>/dev/null | grep -q "${OP_GREP[$i]}.*Succeeded" && OP_OK=true
     fi
+    $OP_OK && echo "  ✅ ${OP_NAMES[$i]}" || echo "  ⬚  ${OP_NAMES[$i]}"
 done
 
 echo ""
