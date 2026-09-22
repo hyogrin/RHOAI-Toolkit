@@ -1794,94 +1794,17 @@ create_datasciencecluster() {
 }
 
 enable_dashboard_features() {
-    print_step "Enabling dashboard features..."
-
-    local elapsed=0
-    while [ $elapsed -lt 120 ]; do
-        if oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications &>/dev/null; then
-            break
-        fi
-        sleep 5
-        elapsed=$((elapsed + 5))
-    done
-
-    # Build dashboard config with all 3.5 feature flags (34 total)
-    # Reference: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5
-    #
-    # Flags carried from 3.4 (14):
-    #   disableModelRegistry: false, disableModelCatalog: false, disableKServeMetrics: false,
-    #   disableLMEval: false, disableKueue: false, genAiStudio, modelAsService,
-    #   maasAuthPolicies, vLLMDeploymentOnMaaS, observabilityDashboard, mcpCatalog,
-    #   llmGatewayField, deploymentWizardYAMLViewer, aiAssetCustomEndpoints
-    #
-    # New flags in 3.5 (20):
-    #   roleManagement        - Custom role creation UI (default true in 3.5)
-    #   gpuaas                - GPU Infrastructure dashboard
-    #   agentOps              - Agent operations management
-    #   agentsCatalog         - Agent templates catalog in AI Hub
-    #   agentConfigManagement - Agent configuration management UI
-    #   automl                - AutoML experiments (requires AI Pipelines)
-    #   autorag               - AutoRAG experiments (requires AI Pipelines)
-    #   connectionTest        - Connection testing in data connection setup
-    #   externalModels        - External model endpoints in Gen AI Studio
-    #   externalVectorStores  - External vector store connections
-    #   featureStoreAdmin     - Feature Store admin capabilities
-    #   genAiTracing          - Gen AI tracing with MLflow
-    #   globalProjectPrompts  - Global project-level prompt management
-    #   guardrails            - Guardrails configuration in model deployment
-    #   llmdTemplates         - llm-d templates in deploy wizard
-    #   mcpRegistry           - MCP server registry (replaces mcpCatalog scope)
-    #   projectRBAC           - Per-project RBAC management UI
-    #   promptManagement      - Prompt management in Gen AI Studio
-    #   toolCalling           - Tool calling configuration for models
-    #   trainingJobs          - Training job management UI
-    local patch_json='{
-        "spec": {
-            "dashboardConfig": {
-                "disableModelRegistry": false,
-                "disableModelCatalog": false,
-                "disableKServeMetrics": false,
-                "disableLMEval": false,
-                "disableKueue": false,
-                "genAiStudio": true,
-                "modelAsService": true,
-                "maasAuthPolicies": true,
-                "vLLMDeploymentOnMaaS": true,
-                "observabilityDashboard": true,
-                "mcpCatalog": true,
-                "llmGatewayField": true,
-                "deploymentWizardYAMLViewer": true,
-                "aiAssetCustomEndpoints": true,
-                "roleManagement": true,
-                "gpuaas": true,
-                "agentOps": true,
-                "agentsCatalog": true,
-                "agentConfigManagement": true,
-                "automl": true,
-                "autorag": true,
-                "connectionTest": true,
-                "externalModels": true,
-                "externalVectorStores": true,
-                "featureStoreAdmin": true,
-                "genAiTracing": true,
-                "globalProjectPrompts": true,
-                "guardrails": true,
-                "llmdTemplates": true,
-                "mcpRegistry": true,
-                "projectRBAC": true,
-                "promptManagement": true,
-                "toolCalling": true,
-                "trainingJobs": true
-            }
-        }
-    }'
-
-    oc patch odhdashboardconfig odh-dashboard-config \
-        -n redhat-ods-applications \
-        --type=merge \
-        -p "$patch_json" 2>/dev/null || print_warning "Could not patch dashboard config yet"
-
-    print_success "Dashboard features enabled (34 flags for RHOAI 3.5)"
+    # Delegate to the standalone 3.5 dashboard features script.
+    # Source it (don't execute) so it shares our shell functions and context.
+    local features_script="$ROOT_DIR/scripts/3.5-enable-dashboard-features.sh"
+    if [ -f "$features_script" ]; then
+        source "$features_script"
+        wait_for_dashboard_config || { print_warning "OdhDashboardConfig not found — will retry later"; return 0; }
+        apply_dashboard_features
+    else
+        print_warning "Dashboard features script not found: $features_script"
+        print_info "Run it manually after install: ./scripts/3.5-enable-dashboard-features.sh --apply"
+    fi
 }
 
 install_mcp_lifecycle_operator() {

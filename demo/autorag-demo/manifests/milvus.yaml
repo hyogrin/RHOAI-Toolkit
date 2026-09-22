@@ -29,7 +29,7 @@ spec:
     spec:
       containers:
         - name: milvus
-          image: milvusdb/milvus:v2.4.17
+          image: milvusdb/milvus:v2.5.7
           command: ["milvus", "run", "standalone"]
           ports:
             - containerPort: 19530

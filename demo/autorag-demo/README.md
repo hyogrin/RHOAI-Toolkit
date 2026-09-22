@@ -1,6 +1,6 @@
 # AutoRAG Demo (Technology Preview)
 
-Automated RAG pipeline optimization -- finds the best retrieval-augmented generation configuration for your documents.
+Automated RAG pipeline optimization — finds the best retrieval-augmented generation configuration for your documents.
 
 ## What AutoRAG Does
 
@@ -20,9 +20,22 @@ Provide documents and test questions, and AutoRAG automatically:
 
 This deploys:
 - MinIO (document storage + pipeline artifacts)
-- Milvus vector database (required by AutoRAG -- inline Milvus not supported)
+- Milvus vector database (required by AutoRAG — inline Milvus not supported)
 - Pipeline Server (DSPA for Kubeflow Pipelines)
 - S3 data connection with sample documents
+- **RHOAI 3.5**: OGX Server (replaces LlamaStack)
+- **RHOAI 3.4**: LlamaStack (auto-detected)
+
+## Version Compatibility
+
+The deploy script auto-detects your RHOAI version:
+
+| RHOAI Version | Component | API | DSC Setting |
+|---|---|---|---|
+| **3.5+** | OGX Server | `ogx.io/v1beta1` OGXServer | `ogx: Managed` |
+| **3.4** | LlamaStack | `llamastack.io/v1alpha1` LlamaStackDistribution | `llamastackoperator: Managed` |
+
+> **Note**: OGX and LlamaStack are mutually exclusive in RHOAI 3.5. The DSC must have `llamastackoperator: Removed` when `ogx: Managed`.
 
 ## Prerequisites
 
@@ -30,10 +43,10 @@ AutoRAG has the heaviest infrastructure requirements of any RHOAI feature:
 
 | Requirement | How to Enable |
 |------------|--------------|
-| Llama Stack Operator | `llamastackoperator: Managed` in DSC (auto-enabled by deploy script) |
-| Llama Stack Instance | Create via dashboard with foundation + embedding models |
-| Embedding Model | Deploy BAAI/bge-m3 (recommended) via Llama Stack |
-| Foundation Model | Any vLLM-served LLM registered with Llama Stack |
+| OGX component (3.5) or Llama Stack Operator (3.4) | `ogx: Managed` or `llamastackoperator: Managed` in DSC (auto-enabled by deploy script) |
+| OGX/LlamaStack Instance | Created by deploy script with foundation + embedding models |
+| Embedding Model | Deploy BAAI/bge-m3 (recommended) via OGX/LlamaStack |
+| Foundation Model | Any vLLM-served LLM registered with OGX/LlamaStack |
 | Remote Milvus | Deployed by this script |
 | AI Pipelines | `aipipelines: Managed` in DSC |
 | Gen AI Studio | `genAiStudio: true` in dashboard config |
@@ -42,40 +55,26 @@ AutoRAG has the heaviest infrastructure requirements of any RHOAI feature:
 
 After running `deploy.sh`, complete these steps in the RHOAI dashboard:
 
-### 1. Set Up Llama Stack Instance
-
-1. Dashboard > Applications > Enabled
-2. Find **Llama Stack** and create an instance
-3. Configure with your deployed models:
-   - Foundation model: your vLLM-served model
-   - Embedding model: `BAAI/bge-m3` (recommended, ~1.1 GB fp16)
-
-### 2. Register Milvus with Llama Stack
-
-1. In Llama Stack settings, add a vector database
-2. Type: **Milvus (remote)**
-3. Endpoint: `milvus.autorag-demo.svc.cluster.local:19530`
-
-### 3. Create Llama Stack Connection
+### 1. Create OGX/LlamaStack Connection
 
 1. Dashboard > autorag-demo project > Connections
-2. Add connection: **Llama Stack**
-   - Base URL: your Llama Stack instance URL
-   - API Key: your Llama Stack API key
+2. Add connection: **OGX Server** (3.5) or **Llama Stack** (3.4)
+   - Base URL: shown in deploy script output
+   - API Key: your API key or leave empty
 
-### 4. Create AutoRAG Optimization Run
+### 2. Create AutoRAG Optimization Run
 
 1. Dashboard > **Develop and train > AutoRAG**
 2. Click **Create run**
 3. Configure:
    - S3 Connection: `AutoRAG Documents`
-   - Llama Stack Connection: (from step 3)
+   - OGX/Llama Stack Connection: (from step 1)
    - Optimization metric: e.g. **Answer correctness**
    - Upload test data: `sample-data/test-data.json`
 4. Optional: Limit models (max 3 foundation + 2 embedding to avoid failures)
 5. Click **Create run**
 
-### 5. Evaluate and Use
+### 3. Evaluate and Use
 
 1. Wait for the run to complete
 2. Review RAG patterns on the leaderboard
@@ -87,9 +86,9 @@ After running `deploy.sh`, complete these steps in the RHOAI dashboard:
 
 ### Documents (`sample-data/docs/`)
 Three markdown documents covering OpenShift AI topics:
-- `openshift-ai-overview.md` -- Platform overview and architecture
-- `model-serving-guide.md` -- Serving runtimes and deployment modes
-- `pipelines-and-training.md` -- Pipelines, AutoML, and distributed training
+- `openshift-ai-overview.md` — Platform overview and architecture
+- `model-serving-guide.md` — Serving runtimes and deployment modes
+- `pipelines-and-training.md` — Pipelines, AutoML, and distributed training
 
 ### Test Data (`sample-data/test-data.json`)
 10 question-answer pairs for evaluating RAG quality, covering topics like:
@@ -109,7 +108,7 @@ Three markdown documents covering OpenShift AI topics:
 
 ## Limitations (Technology Preview)
 
-- English language documents only
+- English language documents only (3.5 adds multilingual TP)
 - Remote Milvus only (inline not supported)
 - Max 3 foundation models + 2 embedding models per run
 - No OCR or table detection for PDFs
