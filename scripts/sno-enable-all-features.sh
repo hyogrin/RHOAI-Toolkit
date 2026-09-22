@@ -6,8 +6,8 @@
 # 모든 DSC 컴포넌트 + Dashboard 메뉴를 한번에 활성화하는 스크립트
 #
 # 사용법:
-#   bash sno-enable-all-features.sh          # 대화형 (누락 Operator 설치 여부 질문)
-#   bash sno-enable-all-features.sh --yes    # 자동 설치 (질문 없이 진행)
+#   bash sno-enable-all-features.sh              # 누락 Operator 자동 설치 + 전체 활성화
+#   bash sno-enable-all-features.sh --skip-install  # Operator 설치 건너뛰기 (설정만)
 #
 # 사전조건:
 #   - oc login 완료
@@ -16,8 +16,8 @@
 ###############################################################################
 set -euo pipefail
 
-AUTO_YES=false
-[[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && AUTO_YES=true
+SKIP_INSTALL=false
+[[ "${1:-}" == "--skip-install" || "${1:-}" == "--skip" ]] && SKIP_INSTALL=true
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 info()    { echo -e "${CYAN}[INFO]${NC} $*"; }
@@ -169,36 +169,17 @@ if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
     for j in "${!MISSING_NAMES[@]}"; do
         printf "${BOLD}│${NC}  %-3s %-30s → %s\n" "$((j+1))." "${MISSING_NAMES[$j]}" "${OP_USE[${MISSING_IDX[$j]}]}"
     done
-    echo -e "${BOLD}├─────────────────────────────────────────────────────────┤${NC}"
-    echo -e "${BOLD}│${NC}  이 스크립트에서 자동 설치할 수 있습니다."
-    echo -e "${BOLD}│${NC}  직접 설치하려면 OpenShift Console에서:"
-    echo -e "${BOLD}│${NC}    Operators → OperatorHub → 이름으로 검색"
-
-    CONSOLE_URL=$(oc whoami --show-console 2>/dev/null || echo "")
-    if [ -n "$CONSOLE_URL" ]; then
-        echo -e "${BOLD}│${NC}    ${CYAN}${CONSOLE_URL}/operatorhub${NC}"
-    fi
     echo -e "${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
-    echo ""
 
-    if [ "$AUTO_YES" = true ]; then
-        REPLY="y"
-    elif [ -t 0 ]; then
-        # 터미널에서 직접 실행 → 사용자 입력 대기
-        echo -en "  자동 설치하시겠습니까? [Y/n] "
-        read -r REPLY </dev/tty
-    else
-        # pipe/비대화형 실행 → 설치하지 않고 안내
-        warn "비대화형 모드: 자동 설치를 건너뜁니다"
-        warn "자동 설치하려면: bash sno-enable-all-features.sh --yes"
-        REPLY="n"
-    fi
-
-    if [[ "$REPLY" =~ ^[Nn]$ ]]; then
-        warn "Operator 설치를 건너뜁니다"
-        warn "누락된 Operator 없이도 진행하지만 일부 기능이 동작하지 않을 수 있습니다"
+    if [ "$SKIP_INSTALL" = true ]; then
+        warn "Operator 설치를 건너뜁니다 (--skip-install)"
+        warn "일부 기능이 동작하지 않을 수 있습니다"
+        echo -e "  직접 설치하려면 Console → Operators → OperatorHub"
+        CONSOLE_URL=$(oc whoami --show-console 2>/dev/null || echo "")
+        [ -n "$CONSOLE_URL" ] && echo -e "  ${CYAN}${CONSOLE_URL}/operatorhub${NC}"
         echo ""
     else
+        info "누락된 Operator를 자동 설치합니다..."
         echo ""
         for j in "${!MISSING_IDX[@]}"; do
             idx=${MISSING_IDX[$j]}
