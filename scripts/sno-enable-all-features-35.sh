@@ -39,12 +39,14 @@ warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERR]${NC}  $*"; }
 
 # Operator definitions (used in Steps 6 and 7)
-declare -a OP_NAMES=( "RHCL (Red Hat Connectivity Link)" "OpenTelemetry"                    "Tempo"                    "COO (Cluster Observability)" )
-declare -a OP_NS=(    "redhat-connectivity-link-operator" "openshift-opentelemetry-operator" "openshift-tempo-operator" "openshift-cluster-observability-operator" )
-declare -a OP_GREP=(  "rhcl-operator"                     "opentelemetry"                    "tempo"                    "cluster-observability-operator" )
-declare -a OP_SUB=(   "rhcl-operator"                     "opentelemetry-product"            "tempo-product"            "cluster-observability-operator" )
-declare -a OP_CH=(    "stable-v1"                         "stable"                           "stable"                   "stable" )
-declare -a OP_USE=(   "MaaS / AIGateway"                  "Metrics & trace collection"       "Distributed trace store"  "Observe & Monitor dashboard (Perses)" )
+# Kueue, cert-manager, LWS are installed first (no network disruption).
+# RHCL is installed last (triggers Service Mesh → may disrupt Web Terminal).
+declare -a OP_NAMES=( "Kueue"              "cert-manager"                    "LWS (LeaderWorkerSet)"       "OpenTelemetry"                    "Tempo"                    "COO (Cluster Observability)"                      "RHCL (Red Hat Connectivity Link)" )
+declare -a OP_NS=(    "openshift-operators" "cert-manager-operator"           "openshift-lws-operator"      "openshift-opentelemetry-operator" "openshift-tempo-operator" "openshift-cluster-observability-operator"          "redhat-connectivity-link-operator" )
+declare -a OP_GREP=(  "kueue"              "cert-manager"                    "leader-worker-set"           "opentelemetry"                    "tempo"                    "cluster-observability-operator"                    "rhcl-operator" )
+declare -a OP_SUB=(   "kueue-operator"     "openshift-cert-manager-operator" "leader-worker-set"           "opentelemetry-product"            "tempo-product"            "cluster-observability-operator"                    "rhcl-operator" )
+declare -a OP_CH=(    "stable-v1.3"        "stable-v1"                       "stable-v1.0"                 "stable"                           "stable"                   "stable"                                            "stable-v1" )
+declare -a OP_USE=(   "Workbenches / DW"   "KServe / Model Serving"          "llm-d distributed inference" "Metrics & trace collection"       "Distributed trace store"  "Observe & Monitor dashboard (Perses)"              "MaaS / AIGateway" )
 
 echo "=============================================="
 echo " RHOAI 3.5 SNO — Enable All Features"
@@ -64,7 +66,24 @@ install_operator() {
     local CHANNEL="${4:-stable}"
 
     info "Installing ${DISPLAY_NAME}..."
-    oc apply -f - <<EOF
+
+    if [ "$NAMESPACE" = "openshift-operators" ]; then
+        # openshift-operators already has Namespace + OperatorGroup
+        oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ${SUB_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  channel: ${CHANNEL}
+  installPlanApproval: Automatic
+  name: ${SUB_NAME}
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+    else
+        oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -90,6 +109,7 @@ spec:
   source: redhat-operators
   sourceNamespace: openshift-marketplace
 EOF
+    fi
 }
 
 ###############################################################################
@@ -480,6 +500,29 @@ if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
     fi
 else
     success "All additional operators installed ✓"
+fi
+
+# LWS operator CR (requires LWS operator)
+if oc get crd leaderworkersetoperators.operator.openshift.io &>/dev/null 2>&1; then
+    if ! oc get leaderworkersetoperator cluster -n openshift-lws-operator &>/dev/null 2>&1; then
+        info "Creating LeaderWorkerSet operator CR..."
+        oc apply -f - <<'EOF'
+apiVersion: operator.openshift.io/v1
+kind: LeaderWorkerSetOperator
+metadata:
+  name: cluster
+  namespace: openshift-lws-operator
+spec:
+  managementState: Managed
+  logLevel: Normal
+  operatorLogLevel: Normal
+EOF
+        success "LeaderWorkerSetOperator CR created"
+    else
+        success "LeaderWorkerSetOperator CR already exists ✓"
+    fi
+else
+    warn "LWS CRD not ready yet — LeaderWorkerSetOperator CR will be created on next run"
 fi
 
 # UIPlugins (requires COO)
