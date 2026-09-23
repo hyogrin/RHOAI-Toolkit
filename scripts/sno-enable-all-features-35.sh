@@ -95,6 +95,8 @@ metadata:
   name: ${SUB_NAME}-group
   namespace: ${NAMESPACE}
 spec:
+  targetNamespaces:
+  - ${NAMESPACE}
   upgradeStrategy: Default
 ---
 apiVersion: operators.coreos.com/v1alpha1
