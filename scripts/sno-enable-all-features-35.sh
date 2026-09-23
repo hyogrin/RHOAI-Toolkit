@@ -46,7 +46,7 @@ declare -a OP_NS=(    "openshift-operators" "cert-manager-operator"           "o
 declare -a OP_GREP=(  "kueue"              "cert-manager"                    "leader-worker-set"           "opentelemetry"                    "tempo"                    "cluster-observability-operator"                    "rhcl-operator" )
 declare -a OP_SUB=(   "kueue-operator"     "openshift-cert-manager-operator" "leader-worker-set"           "opentelemetry-product"            "tempo-product"            "cluster-observability-operator"                    "rhcl-operator" )
 declare -a OP_CH=(    "stable-v1.3"        "stable-v1"                       "stable-v1.0"                 "stable"                           "stable"                   "stable"                                            "auto" )
-declare -a OP_MODE=(  "skip"               "own"                             "own"                         "own"                              "own"                      "own"                                               "all" )
+declare -a OP_MODE=(  "skip"               "own"                             "own"                         "all"                              "all"                      "all"                                               "all" )
 declare -a OP_USE=(   "Workbenches / DW"   "KServe / Model Serving"          "llm-d distributed inference" "Metrics & trace collection"       "Distributed trace store"  "Observe & Monitor dashboard (Perses)"              "MaaS / AIGateway" )
 
 echo "=============================================="
