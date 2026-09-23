@@ -3,8 +3,15 @@
 # sno-setup-maas-35.sh
 #
 # Set up MaaS (Models-as-a-Service) infrastructure on an SNO cluster
-# running RHOAI 3.5. Deploys a POC PostgreSQL, configures TLS via
-# OpenShift service-ca, and optionally sets up Redis rate limiting.
+# running RHOAI 3.5. Deploys a POC PostgreSQL, configures Authorino TLS
+# via OpenShift service-ca, and optionally sets up Redis rate limiting.
+#
+# Key design decisions (RHOAI 3.5.1):
+#   - maas-db-config secret goes in redhat-ai-gateway-infra (not redhat-ods-applications)
+#   - Authorino CR uses v1beta1 API
+#   - Authorino is created WITHOUT TLS first, then service-ca generates
+#     the cert, then TLS is enabled (avoids chicken-and-egg deadlock)
+#   - PostgreSQL DB URL uses FQDN for cross-namespace DNS resolution
 #
 # Usage:
 #   bash sno-setup-maas-35.sh                                  # POC PostgreSQL
@@ -55,6 +62,9 @@ echo " RHOAI 3.5 SNO — MaaS Setup"
 echo "=============================================="
 echo ""
 
+# The namespace where maas-api and Authorino run in RHOAI 3.5.1
+MAAS_INFRA_NS="redhat-ai-gateway-infra"
+
 ###############################################################################
 # Pre-flight checks
 ###############################################################################
@@ -101,15 +111,37 @@ else
     exit 1
 fi
 
+# Ensure MaaS infra namespace exists
+if ! oc get ns "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
+    warn "$MAAS_INFRA_NS namespace not found — will be created by operator"
+    info "Waiting for $MAAS_INFRA_NS namespace (up to 120s)..."
+    WAIT=0
+    while [ $WAIT -lt 120 ]; do
+        oc get ns "$MAAS_INFRA_NS" &>/dev/null 2>&1 && break
+        sleep 5; WAIT=$((WAIT + 5))
+    done
+    if ! oc get ns "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
+        error "$MAAS_INFRA_NS namespace not created. Ensure aigateway is Managed in DSC."
+        exit 1
+    fi
+fi
+success "Namespace: $MAAS_INFRA_NS ✓"
+
 echo ""
+
+# Determine the namespace where PostgreSQL is deployed
+PG_DEPLOY_NS="redhat-ods-applications"
 
 ###############################################################################
 # Step 1. PostgreSQL database
+#   PostgreSQL deploys in redhat-ods-applications.
+#   maas-db-config secret goes in redhat-ai-gateway-infra (where maas-api runs).
+#   DB URL must use FQDN for cross-namespace DNS resolution.
 ###############################################################################
 info "=== Step 1/4: PostgreSQL database ==="
 
-if oc get secret maas-db-config -n redhat-ods-applications &>/dev/null; then
-    success "maas-db-config secret already exists [SKIP]"
+if oc get secret maas-db-config -n "$MAAS_INFRA_NS" &>/dev/null; then
+    success "maas-db-config secret already exists in $MAAS_INFRA_NS [SKIP]"
 elif [ -n "$POSTGRES_CONNECTION" ]; then
     info "Creating maas-db-config from provided connection string..."
     printf '%s' "$POSTGRES_CONNECTION" | \
@@ -117,8 +149,8 @@ elif [ -n "$POSTGRES_CONNECTION" ]; then
             --from-file=DB_CONNECTION_URL=/dev/stdin \
             --dry-run=client -o yaml | \
         oc label --local -f - app=maas-api --dry-run=client -o yaml | \
-        oc apply -n redhat-ods-applications -f -
-    success "maas-db-config created (external DB)"
+        oc apply -n "$MAAS_INFRA_NS" -f -
+    success "maas-db-config created in $MAAS_INFRA_NS (external DB)"
 else
     warn "No --postgres-connection provided. Deploying POC PostgreSQL (NOT for production)."
     info "For production: AWS RDS, Crunchy Operator, or Azure Database for PostgreSQL"
@@ -136,17 +168,16 @@ else
     fi
     info "PostgreSQL image: $PG_IMAGE"
 
-    # Apply manifests
+    # Deploy PostgreSQL in redhat-ods-applications
     if [ -f "$ROOT_DIR/lib/manifests/maas/postgres-pvc.yaml" ]; then
-        oc apply -n redhat-ods-applications -f "$ROOT_DIR/lib/manifests/maas/postgres-pvc.yaml"
-        oc apply -n redhat-ods-applications -f "$ROOT_DIR/lib/manifests/maas/postgres-service.yaml"
+        oc apply -n "$PG_DEPLOY_NS" -f "$ROOT_DIR/lib/manifests/maas/postgres-pvc.yaml"
+        oc apply -n "$PG_DEPLOY_NS" -f "$ROOT_DIR/lib/manifests/maas/postgres-service.yaml"
         export PG_IMAGE PG_USER PG_PASSWORD PG_DB
         envsubst '${PG_IMAGE} ${PG_USER} ${PG_PASSWORD} ${PG_DB}' \
-            < "$ROOT_DIR/lib/manifests/maas/postgres-deployment.yaml" | oc apply -n redhat-ods-applications -f -
+            < "$ROOT_DIR/lib/manifests/maas/postgres-deployment.yaml" | oc apply -n "$PG_DEPLOY_NS" -f -
     else
-        # Inline manifests (for standalone use without repo)
         info "Deploying PostgreSQL inline..."
-        oc apply -n redhat-ods-applications -f - <<EOF
+        oc apply -n "$PG_DEPLOY_NS" -f - <<EOF
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -202,92 +233,162 @@ EOF
     info "Waiting for PostgreSQL..."
     WAIT=0
     while [ $WAIT -lt 120 ]; do
-        oc rollout status deployment/postgres -n redhat-ods-applications --timeout=5s &>/dev/null && break
+        oc rollout status deployment/postgres -n "$PG_DEPLOY_NS" --timeout=5s &>/dev/null && break
         sleep 5; WAIT=$((WAIT + 5))
     done
     success "PostgreSQL ready"
 
-    # Recover password (still in PG_PASSWORD before unset — use deployment env)
-    PG_PASSWORD_ACTUAL=$(oc get deployment postgres -n redhat-ods-applications \
+    # Build DB URL with FQDN (cross-namespace resolution)
+    PG_PASSWORD_ACTUAL=$(oc get deployment postgres -n "$PG_DEPLOY_NS" \
         -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_PASSWORD")].value}' 2>/dev/null)
     ENCODED_PW=$(printf '%s' "$PG_PASSWORD_ACTUAL" | od -An -tx1 | tr -d ' \n' | sed 's/../%&/g')
-    DB_URL="postgresql://${PG_USER}:${ENCODED_PW}@postgres:5432/${PG_DB}?sslmode=disable"
+    PG_FQDN="postgres.${PG_DEPLOY_NS}.svc.cluster.local"
+    DB_URL="postgresql://${PG_USER}:${ENCODED_PW}@${PG_FQDN}:5432/${PG_DB}?sslmode=disable"
 
+    # Create maas-db-config in the MaaS infra namespace (where maas-api reads it)
     printf '%s' "$DB_URL" | \
         oc create secret generic maas-db-config \
             --from-file=DB_CONNECTION_URL=/dev/stdin \
             --dry-run=client -o yaml | \
         oc label --local -f - app=maas-api --dry-run=client -o yaml | \
-        oc apply -n redhat-ods-applications -f -
+        oc apply -n "$MAAS_INFRA_NS" -f -
+
+    # Also keep a copy in redhat-ods-applications for reference
+    printf '%s' "$DB_URL" | \
+        oc create secret generic maas-db-config \
+            --from-file=DB_CONNECTION_URL=/dev/stdin \
+            --dry-run=client -o yaml | \
+        oc label --local -f - app=maas-api --dry-run=client -o yaml | \
+        oc apply -n "$PG_DEPLOY_NS" -f -
 
     oc create secret generic postgres-creds \
         --from-literal=user="$PG_USER" \
         --from-literal=password="$PG_PASSWORD_ACTUAL" \
         --from-literal=database="$PG_DB" \
-        -n redhat-ods-applications --dry-run=client -o yaml | \
-        oc apply -n redhat-ods-applications -f -
+        -n "$PG_DEPLOY_NS" --dry-run=client -o yaml | \
+        oc apply -n "$PG_DEPLOY_NS" -f -
 
-    success "maas-db-config secret created (POC PostgreSQL)"
+    success "maas-db-config created in $MAAS_INFRA_NS (FQDN: $PG_FQDN)"
 fi
 echo ""
 
 ###############################################################################
-# Step 2. MaaS TLS (service-ca method)
+# Step 2. Authorino + TLS (service-ca method)
+#   Order: create Authorino WITHOUT TLS → wait for service → annotate for
+#   service-ca cert → wait for cert → patch to enable TLS.
+#   This avoids the chicken-and-egg problem where Authorino won't start
+#   without the TLS cert, but the cert can't be generated without the service.
 ###############################################################################
-info "=== Step 2/4: MaaS TLS configuration ==="
+info "=== Step 2/4: Authorino + TLS configuration ==="
 
-# Annotate Authorino service for OpenShift service-ca cert
-info "Annotating Authorino service for service-ca TLS..."
-oc annotate service authorino-authorino-authorization \
-    -n kuadrant-system \
-    service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
-    --overwrite 2>/dev/null || {
-    warn "Could not annotate Authorino service — may not exist in kuadrant-system"
-    # Try redhat-ai-gateway-infra namespace (RHOAI 3.5 may use this)
-    oc annotate service authorino-authorino-authorization \
-        -n redhat-ai-gateway-infra \
-        service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
-        --overwrite 2>/dev/null || warn "Authorino service not found in either namespace"
-}
+# Detect Authorino CRD API version
+AUTHORINO_API_VERSION="operator.authorino.kuadrant.io/v1beta1"
+if oc get crd authorinos.operator.authorino.kuadrant.io -o jsonpath='{.spec.versions[*].name}' 2>/dev/null | grep -q "v1beta2"; then
+    AUTHORINO_API_VERSION="operator.authorino.kuadrant.io/v1beta2"
+fi
+info "Authorino API: $AUTHORINO_API_VERSION"
 
-# Wait for cert
-info "Waiting for service-ca to generate TLS cert..."
-WAIT=0
-AUTHORINO_NS="kuadrant-system"
-oc get ns kuadrant-system &>/dev/null 2>&1 || AUTHORINO_NS="redhat-ai-gateway-infra"
-while [ $WAIT -lt 60 ]; do
-    oc get secret authorino-server-cert -n "$AUTHORINO_NS" &>/dev/null && break
-    sleep 5; WAIT=$((WAIT + 5))
-done
-oc get secret authorino-server-cert -n "$AUTHORINO_NS" &>/dev/null && \
-    success "Authorino TLS cert generated ✓" || warn "TLS cert not ready yet"
+# Check if Authorino is already running with TLS
+AUTHORINO_READY=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+AUTHORINO_TLS=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+    -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
 
-# Patch Authorino CR for TLS listener
-info "Patching Authorino CR..."
-oc patch authorino authorino -n "$AUTHORINO_NS" --type=merge -p '{
-  "spec": {
-    "listener": {
-      "tls": {
-        "enabled": true,
-        "certSecretRef": { "name": "authorino-server-cert" }
-      }
-    }
-  }
-}' 2>/dev/null || warn "Could not patch Authorino CR"
+if [ "$AUTHORINO_READY" = "True" ] && [ "$AUTHORINO_TLS" = "true" ]; then
+    success "Authorino already running with TLS ✓"
+else
+    # Step 2a: Create or patch Authorino WITHOUT TLS to get the service created
+    info "Creating Authorino instance (TLS disabled initially)..."
+    oc apply -f - <<EOF
+apiVersion: ${AUTHORINO_API_VERSION}
+kind: Authorino
+metadata:
+  name: authorino
+  namespace: ${MAAS_INFRA_NS}
+spec:
+  authConfigLabelSelectors: security.opendatahub.io/authorization-group=default
+  clusterWide: true
+  listener:
+    tls:
+      enabled: false
+  oidcServer:
+    tls:
+      enabled: false
+EOF
 
-# Set TLS env vars
-oc -n "$AUTHORINO_NS" set env deployment/authorino \
-    SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-    REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-    2>/dev/null || warn "Could not set Authorino TLS env vars"
+    # Step 2b: Wait for Authorino service to appear
+    info "Waiting for Authorino service..."
+    WAIT=0
+    while [ $WAIT -lt 90 ]; do
+        if oc get svc authorino-authorino-authorization -n "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
+            success "Authorino service created"
+            break
+        fi
+        sleep 5; WAIT=$((WAIT + 5))
+    done
 
-# Annotate gateway
+    if ! oc get svc authorino-authorino-authorization -n "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
+        warn "Authorino service not created after 90s — check operator logs"
+    else
+        # Step 2c: Annotate service for service-ca TLS cert generation
+        info "Annotating service for service-ca TLS cert..."
+        oc annotate service authorino-authorino-authorization \
+            -n "$MAAS_INFRA_NS" \
+            service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
+            --overwrite
+
+        # Step 2d: Wait for service-ca to generate the cert
+        info "Waiting for TLS cert generation..."
+        WAIT=0
+        while [ $WAIT -lt 60 ]; do
+            if oc get secret authorino-server-cert -n "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
+                success "TLS cert generated (authorino-server-cert)"
+                break
+            fi
+            sleep 3; WAIT=$((WAIT + 3))
+        done
+
+        if oc get secret authorino-server-cert -n "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
+            # Step 2e: Enable TLS on Authorino
+            info "Enabling TLS on Authorino..."
+            oc patch authorino authorino -n "$MAAS_INFRA_NS" --type=merge -p '{
+              "spec": {
+                "listener": {
+                  "tls": {
+                    "enabled": true,
+                    "certSecretRef": { "name": "authorino-server-cert" }
+                  }
+                }
+              }
+            }'
+
+            # Wait for Authorino to reconcile with TLS
+            info "Waiting for Authorino to become ready with TLS..."
+            WAIT=0
+            while [ $WAIT -lt 60 ]; do
+                READY=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+                    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+                [ "$READY" = "True" ] && break
+                sleep 5; WAIT=$((WAIT + 5))
+            done
+
+            READY=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+                -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+            [ "$READY" = "True" ] && success "Authorino ready with TLS ✓" || \
+                warn "Authorino not fully ready yet (will reconcile in background)"
+        else
+            warn "TLS cert not generated after 60s — Authorino running without TLS"
+        fi
+    fi
+fi
+
+# Annotate MaaS gateway for Authorino TLS bootstrap
 oc annotate gateway maas-default-gateway \
     -n openshift-ingress \
     security.opendatahub.io/authorino-tls-bootstrap="true" \
     --overwrite 2>/dev/null || warn "Could not annotate maas-default-gateway"
 
-success "MaaS TLS configured"
+success "Authorino + TLS configuration complete"
 echo ""
 
 ###############################################################################
@@ -299,17 +400,17 @@ if [ "$SKIP_RATE_LIMITING" = true ]; then
 else
     info "=== Step 3/4: Rate limiting (Redis + EnvoyFilters) ==="
 
-    # Redis for Limitador
-    if oc get deployment limitador-redis -n "$AUTHORINO_NS" &>/dev/null; then
-        success "Limitador Redis already deployed ✓"
+    # Redis for rate limiting
+    if oc get deployment limitador-redis -n "$MAAS_INFRA_NS" &>/dev/null; then
+        success "Redis already deployed ✓"
     else
-        info "Deploying Redis for Limitador..."
+        info "Deploying Redis..."
         oc apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: limitador-redis
-  namespace: ${AUTHORINO_NS}
+  namespace: ${MAAS_INFRA_NS}
   labels: { app: limitador-redis }
 spec:
   replicas: 1
@@ -329,29 +430,29 @@ apiVersion: v1
 kind: Service
 metadata:
   name: limitador-redis
-  namespace: ${AUTHORINO_NS}
+  namespace: ${MAAS_INFRA_NS}
 spec:
   selector: { app: limitador-redis }
   ports: [{ port: 6379, targetPort: 6379 }]
 EOF
-        oc rollout status deployment/limitador-redis -n "$AUTHORINO_NS" --timeout=60s 2>/dev/null || true
+        oc rollout status deployment/limitador-redis -n "$MAAS_INFRA_NS" --timeout=60s 2>/dev/null || true
         success "Redis deployed"
     fi
 
     # Redis connection secret
-    if ! oc get secret limitador-redis-config -n "$AUTHORINO_NS" &>/dev/null; then
+    if ! oc get secret limitador-redis-config -n "$MAAS_INFRA_NS" &>/dev/null; then
         oc create secret generic limitador-redis-config \
-            --from-literal=URL="redis://limitador-redis.${AUTHORINO_NS}.svc.cluster.local:6379" \
-            -n "$AUTHORINO_NS"
+            --from-literal=URL="redis://limitador-redis.${MAAS_INFRA_NS}.svc.cluster.local:6379" \
+            -n "$MAAS_INFRA_NS"
     fi
 
     # Patch Limitador for redis-cached storage (CRD may not exist in all versions)
     if oc get crd limitadors.limitador.kuadrant.io &>/dev/null 2>&1; then
-        CURRENT_STORAGE=$(oc get limitador limitador -n "$AUTHORINO_NS" \
+        CURRENT_STORAGE=$(oc get limitador limitador -n "$MAAS_INFRA_NS" \
             -o jsonpath='{.spec.storage.redis-cached}' 2>/dev/null || true)
         if [ -z "$CURRENT_STORAGE" ]; then
             info "Configuring Limitador with redis-cached storage..."
-            if oc patch limitador limitador -n "$AUTHORINO_NS" --type=merge -p '{
+            if oc patch limitador limitador -n "$MAAS_INFRA_NS" --type=merge -p '{
                 "spec": {
                     "storage": {
                         "redis-cached": {
@@ -440,7 +541,7 @@ EOF
         success "Ratelimit timeout (2s) applied"
     fi
 
-    # Restart gateway
+    # Restart MaaS gateway to pick up EnvoyFilter changes
     MAAS_DEPLOY=$(oc get deployment -n openshift-ingress \
         -l "gateway.networking.k8s.io/gateway-name=maas-default-gateway" \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
@@ -453,39 +554,78 @@ EOF
 fi
 
 ###############################################################################
+# Restart maas-api to pick up new secrets
+###############################################################################
+info "Restarting maas-api to pick up configuration..."
+oc rollout restart deployment/maas-api -n "$MAAS_INFRA_NS" 2>/dev/null || true
+WAIT=0
+while [ $WAIT -lt 60 ]; do
+    if oc get pods -n "$MAAS_INFRA_NS" --no-headers 2>/dev/null | grep "maas-api" | grep -q "Running"; then
+        READY=$(oc get pods -n "$MAAS_INFRA_NS" -l app=maas-api -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || true)
+        [ "$READY" = "true" ] && break
+    fi
+    sleep 5; WAIT=$((WAIT + 5))
+done
+if oc get pods -n "$MAAS_INFRA_NS" --no-headers 2>/dev/null | grep "maas-api" | grep -q "1/1.*Running"; then
+    success "maas-api running ✓"
+else
+    warn "maas-api not fully ready yet — check: oc logs deployment/maas-api -n $MAAS_INFRA_NS"
+fi
+echo ""
+
+###############################################################################
 # Step 4. Verification
 ###############################################################################
 info "=== Step 4/4: Verification ==="
 
 # maas-db-config
-if oc get secret maas-db-config -n redhat-ods-applications &>/dev/null; then
-    HAS_URL=$(oc get secret maas-db-config -n redhat-ods-applications \
+if oc get secret maas-db-config -n "$MAAS_INFRA_NS" &>/dev/null; then
+    HAS_URL=$(oc get secret maas-db-config -n "$MAAS_INFRA_NS" \
         -o jsonpath='{.data.DB_CONNECTION_URL}' 2>/dev/null)
-    [ -n "$HAS_URL" ] && echo "  ✅ maas-db-config (DB_CONNECTION_URL set)" || echo "  ⬚  maas-db-config (missing URL key)"
+    [ -n "$HAS_URL" ] && echo "  ✅ maas-db-config in $MAAS_INFRA_NS" || echo "  ⬚  maas-db-config (missing URL key)"
 else
-    echo "  ⬚  maas-db-config NOT FOUND"
+    echo "  ⬚  maas-db-config NOT FOUND in $MAAS_INFRA_NS"
 fi
 
 # Authorino TLS
-TLS_ENABLED=$(oc get authorino authorino -n "$AUTHORINO_NS" \
-    -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null)
-[ "$TLS_ENABLED" = "true" ] && echo "  ✅ Authorino TLS enabled" || echo "  ⬚  Authorino TLS"
+TLS_ENABLED=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+    -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
+AUTHORINO_READY=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+if [ "$TLS_ENABLED" = "true" ] && [ "$AUTHORINO_READY" = "True" ]; then
+    echo "  ✅ Authorino TLS enabled & ready"
+elif [ "$TLS_ENABLED" = "true" ]; then
+    echo "  ⬚  Authorino TLS enabled but not ready yet"
+else
+    echo "  ⬚  Authorino TLS not enabled"
+fi
+
+# maas-api
+MAAS_API_RUNNING=$(oc get pods -n "$MAAS_INFRA_NS" --no-headers 2>/dev/null | grep "maas-api" | grep -c "1/1.*Running" || true)
+[ "$MAAS_API_RUNNING" -ge 1 ] && echo "  ✅ maas-api running" || echo "  ⬚  maas-api not running"
 
 # MaaS Tenant
 TENANT_READY=$(oc get tenant default-tenant -n models-as-a-service \
-    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
 if [ "$TENANT_READY" = "True" ]; then
     echo "  ✅ MaaS Tenant ready"
 else
     TENANT_MSG=$(oc get tenant default-tenant -n models-as-a-service \
-        -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null)
-    echo "  ⬚  MaaS Tenant (${TENANT_MSG:-not found yet})"
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || true)
+    echo "  ⬚  MaaS Tenant (${TENANT_MSG:-not found yet — may take a few minutes})"
 fi
 
 # ModelsAsAServiceReady
 MAAS_STATUS=$(oc get datasciencecluster default-dsc \
-    -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].status}' 2>/dev/null)
-[ "$MAAS_STATUS" = "True" ] && echo "  ✅ ModelsAsAServiceReady" || echo "  ⬚  ModelsAsAServiceReady"
+    -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].status}' 2>/dev/null || true)
+MAAS_MSG=$(oc get datasciencecluster default-dsc \
+    -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].message}' 2>/dev/null || true)
+if [ "$MAAS_STATUS" = "True" ]; then
+    echo "  ✅ ModelsAsAServiceReady"
+else
+    echo "  ⬚  ModelsAsAServiceReady"
+    [ -n "$MAAS_MSG" ] && echo "      $MAAS_MSG"
+fi
 
 CLUSTER_DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')
 
@@ -494,8 +634,11 @@ echo "=============================================="
 success "MaaS setup complete!"
 echo ""
 echo "  MaaS endpoint:  https://maas.${CLUSTER_DOMAIN}"
-echo "  Dashboard:      https://data-science-gateway.${CLUSTER_DOMAIN}"
+echo "  Dashboard:      https://$(oc get gatewayconfig default-gateway -n redhat-ods-applications -o jsonpath='{.status.domain}' 2>/dev/null || echo "data-science-gateway.${CLUSTER_DOMAIN}")"
 echo ""
 echo "  Deploy a model via Dashboard → Models → llm-d runtime"
 echo "  or use LLMInferenceService CR (see docs)"
+echo ""
+echo "  If ModelsAsAServiceReady shows ⬚, wait 2-3 minutes and check:"
+echo "    oc get datasciencecluster default-dsc -o jsonpath='{.status.conditions[?(@.type==\"ModelsAsAServiceReady\")]}' | python3 -m json.tool"
 echo "=============================================="
