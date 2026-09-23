@@ -994,6 +994,29 @@ else
     warn "COO not ready yet — UIPlugins will be configured on next run"
 fi
 
+# Kuadrant CR (requires RHCL operator)
+# The Kuadrant CR activates RHCL features: AuthPolicy, RateLimitPolicy,
+# TokenRateLimitPolicy, DNSPolicy, and TLSPolicy. Without it, RHCL is
+# installed but inactive — the Connectivity Link menu shows no resources.
+if oc get crd kuadrants.kuadrant.io &>/dev/null 2>&1; then
+    if oc get kuadrant kuadrant -n redhat-connectivity-link-operator &>/dev/null 2>&1; then
+        success "Kuadrant CR already exists ✓"
+    else
+        info "Creating Kuadrant CR..."
+        oc apply -f - <<'EOF'
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: redhat-connectivity-link-operator
+spec: {}
+EOF
+        success "Kuadrant CR created (activates RHCL features)"
+    fi
+else
+    warn "Kuadrant CRD not ready yet — Kuadrant CR will be created on next run"
+fi
+
 # RHCL Console Plugin (requires RHCL operator)
 # The kuadrant-console-plugin provides RHCL / Kuadrant UI for managing
 # API policies, rate limiting, and gateway configuration in the console.
@@ -1082,6 +1105,17 @@ for PLUGIN_NAME in kuadrant-console-plugin console-dashboards-plugin monitoring-
         echo "  ⬚  ${PLUGIN_NAME}"
     fi
 done
+
+echo ""
+info "Operator CRs:"
+# Kuadrant CR
+KUADRANT_READY=$(oc get kuadrant kuadrant -n redhat-connectivity-link-operator \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+[ "$KUADRANT_READY" = "True" ] && echo "  ✅ Kuadrant CR (Ready)" || echo "  ⬚  Kuadrant CR (${KUADRANT_READY:-not found})"
+# LWS operator CR
+LWS_AVAILABLE=$(oc get leaderworkersetoperator cluster -n openshift-lws-operator \
+    -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+[ "$LWS_AVAILABLE" = "True" ] && echo "  ✅ LeaderWorkerSetOperator CR" || echo "  ⬚  LeaderWorkerSetOperator CR (${LWS_AVAILABLE:-not found})"
 
 echo ""
 info "Services:"

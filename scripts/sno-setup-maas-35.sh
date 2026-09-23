@@ -652,7 +652,10 @@ echo "=============================================="
 success "MaaS setup complete!"
 echo ""
 echo "  MaaS endpoint:  https://maas.${CLUSTER_DOMAIN}"
-echo "  Dashboard:      https://$(oc get gatewayconfig default-gateway -n redhat-ods-applications -o jsonpath='{.status.domain}' 2>/dev/null || echo "data-science-gateway.${CLUSTER_DOMAIN}")"
+DASHBOARD_URL=$(oc get route data-science-gateway -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || \
+               oc get route rh-ai -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || \
+               echo "data-science-gateway.${CLUSTER_DOMAIN}")
+echo "  Dashboard:      https://${DASHBOARD_URL}"
 echo ""
 echo "  Deploy a model via Dashboard → Models → llm-d runtime"
 echo "  or use LLMInferenceService CR (see docs)"

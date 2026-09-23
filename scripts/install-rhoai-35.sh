@@ -1013,6 +1013,23 @@ install_rhcl_operator() {
 
     restart_kuadrant_operator
 
+    # Enable RHCL console plugin (Connectivity Link menu in OpenShift console)
+    if oc get consoleplugin kuadrant-console-plugin &>/dev/null 2>&1; then
+        local enabled_plugins
+        enabled_plugins=$(oc get console.operator.openshift.io cluster \
+            -o jsonpath='{.spec.plugins}' 2>/dev/null || echo "[]")
+        if echo "$enabled_plugins" | grep -q "kuadrant-console-plugin"; then
+            print_info "RHCL console plugin already enabled"
+        else
+            if oc patch console.operator.openshift.io cluster --type=json \
+                -p '[{"op":"add","path":"/spec/plugins/-","value":"kuadrant-console-plugin"}]' 2>/dev/null; then
+                print_success "RHCL console plugin enabled (Connectivity Link menu)"
+            else
+                print_warning "Could not enable RHCL console plugin"
+            fi
+        fi
+    fi
+
     print_success "RHCL Operator installed and configured"
 }
 

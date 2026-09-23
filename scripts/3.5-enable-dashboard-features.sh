@@ -2,7 +2,7 @@
 ################################################################################
 # Enable All Dashboard Features for RHOAI 3.5
 ################################################################################
-# Enables all 34 dashboard feature flags for Red Hat OpenShift AI 3.5.
+# Enables all 37 dashboard feature flags for Red Hat OpenShift AI 3.5.
 #
 # Reference:
 #   - https://www.redhat.com/en/blog/red-hat-ai-35-scaling-and-governing-ai-agents-production
@@ -64,10 +64,10 @@ type print_error &>/dev/null 2>&1   || print_error()   { echo "✗ $*"; }
 type print_header &>/dev/null 2>&1  || print_header()  { echo ""; echo "═══ $* ═══"; echo ""; }
 
 ################################################################################
-# Dashboard Feature Flags — RHOAI 3.5 (34 total)
+# Dashboard Feature Flags — RHOAI 3.5 (37 total)
 ################################################################################
 
-# All 34 flags in a single JSON patch.
+# All 37 flags in a single JSON patch.
 # Flags are grouped by origin:
 #   - 14 carried from 3.4
 #   - 20 new in 3.5
@@ -190,7 +190,7 @@ ensure_dsci_observability() {
 }
 
 apply_dashboard_features() {
-    print_step "Applying 34 dashboard feature flags for RHOAI 3.5..."
+    print_step "Applying 37 dashboard feature flags for RHOAI 3.5..."
 
     local patch_json
     patch_json=$(build_dashboard_patch)
@@ -199,7 +199,7 @@ apply_dashboard_features() {
         -n redhat-ods-applications \
         --type=merge \
         -p "$patch_json" 2>/dev/null; then
-        print_success "Dashboard features enabled (34 flags for RHOAI 3.5)"
+        print_success "Dashboard features enabled (37 flags for RHOAI 3.5)"
     else
         print_error "Failed to patch OdhDashboardConfig"
         return 1
@@ -344,7 +344,7 @@ main() {
             --help|-h)
                 echo "Usage: $0 [--apply | --verify | --help]"
                 echo ""
-                echo "  --apply    Apply all 34 feature flags non-interactively"
+                echo "  --apply    Apply all 37 feature flags non-interactively"
                 echo "  --verify   Check current dashboard feature status"
                 echo "  --help     Show this help"
                 echo ""
@@ -370,7 +370,7 @@ main() {
         print_header "Enable All Dashboard Features — RHOAI 3.5"
         show_feature_summary
 
-        read -p "Apply all 34 dashboard feature flags? (y/N): " confirm
+        read -p "Apply all 37 dashboard feature flags? (y/N): " confirm
         if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
             print_info "Cancelled"
             exit 0
