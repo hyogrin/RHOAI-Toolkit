@@ -286,8 +286,20 @@ echo ""
 # Step 3/8: MLflow server + demo project
 #   Creates the demo Data Science Project and a cluster-scoped MLflow CR.
 #   The MLflow operator (enabled in Step 2) creates HTTPRoute + tracking UI.
+#
+#   Idempotency scenarios handled:
+#   - PostgreSQL in CrashLoopBackOff → recovers with fresh PVC
+#   - mlflow-db-credentials secret missing → (re)created every run
+#   - MLflow CR exists but migration stuck → deletes stuck job for retry
+#   - MLflow CR exists and healthy → skips
+#   - No PostgreSQL at all → falls back to SQLite
+#
+#   Note: Uses the existing 'maas' database for MLflow (the maas user does
+#   not have CREATEDB privilege). MLflow creates its own tables within it.
 ###############################################################################
 info "=== Step 3/8: MLflow server + demo project ==="
+
+MLFLOW_NS="redhat-ods-applications"
 
 # Ensure demo namespace exists as a Data Science Project
 if oc get ns demo &>/dev/null 2>&1; then
@@ -311,40 +323,112 @@ done
 if oc get crd mlflows.mlflow.opendatahub.io &>/dev/null 2>&1; then
     success "MLflow CRD registered ✓"
 
-    # Check if MLflow CR already exists
-    if oc get mlflow mlflow &>/dev/null 2>&1; then
-        success "MLflow server already exists ✓"
-    else
-        # Use PostgreSQL if available, otherwise SQLite with PVC
-        if oc get deployment postgres -n redhat-ods-applications &>/dev/null 2>&1; then
-            info "Using existing PostgreSQL for MLflow backend..."
+    MLFLOW_BACKEND="sqlite"
 
-            # Create mlflow database in PostgreSQL (idempotent)
-            PG_POD=$(oc get pods -n redhat-ods-applications -l app=postgres \
-                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-            if [ -n "$PG_POD" ]; then
-                oc exec "$PG_POD" -n redhat-ods-applications -- bash -c \
-                    'PGPASSWORD=$POSTGRESQL_PASSWORD psql -U $POSTGRESQL_USER -d $POSTGRESQL_DATABASE -tc \
-                    "SELECT 1 FROM pg_database WHERE datname='"'"'mlflow'"'"'" | grep -q 1 || \
-                    PGPASSWORD=$POSTGRESQL_PASSWORD psql -U $POSTGRESQL_USER -d $POSTGRESQL_DATABASE -c \
-                    "CREATE DATABASE mlflow;"' 2>/dev/null || warn "Could not create mlflow DB (may already exist)"
+    # --- PostgreSQL health check + mlflow-db-credentials secret ---
+    # This block runs every time (not just on first MLflow CR creation)
+    # to recover from missing secrets or PostgreSQL CrashLoopBackOff.
+    if oc get deployment postgres -n "$MLFLOW_NS" &>/dev/null 2>&1; then
+
+        # Check if PostgreSQL pod is healthy
+        PG_READY=$(oc get pods -n "$MLFLOW_NS" -l app=postgres \
+            -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || true)
+
+        if [ "$PG_READY" != "true" ]; then
+            # Check for CrashLoopBackOff (common: set_passwords.sh race condition)
+            PG_WAITING=$(oc get pods -n "$MLFLOW_NS" -l app=postgres \
+                -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
+            if [ "$PG_WAITING" = "CrashLoopBackOff" ]; then
+                warn "PostgreSQL in CrashLoopBackOff — recovering with fresh PVC..."
+                oc scale deployment postgres -n "$MLFLOW_NS" --replicas=0 2>/dev/null
+                sleep 3
+                oc delete pvc postgres-data -n "$MLFLOW_NS" 2>/dev/null || true
+                oc apply -n "$MLFLOW_NS" -f - <<'PGPVC'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  labels: { app: postgres, purpose: poc }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 20Gi } }
+PGPVC
+                oc scale deployment postgres -n "$MLFLOW_NS" --replicas=1 2>/dev/null
             fi
 
-            # Build PostgreSQL URL for MLflow
-            PG_DEPLOY_NS="redhat-ods-applications"
-            PG_FQDN="postgres.${PG_DEPLOY_NS}.svc.cluster.local"
-            PG_PASSWORD_ACTUAL=$(oc get deployment postgres -n "$PG_DEPLOY_NS" \
+            info "Waiting for PostgreSQL to become ready (up to 60s)..."
+            WAIT=0
+            while [ $WAIT -lt 60 ]; do
+                PG_READY=$(oc get pods -n "$MLFLOW_NS" -l app=postgres \
+                    -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || true)
+                [ "$PG_READY" = "true" ] && break
+                sleep 5; WAIT=$((WAIT + 5))
+            done
+        fi
+
+        if [ "$PG_READY" = "true" ]; then
+            success "PostgreSQL running ✓"
+            MLFLOW_BACKEND="postgres"
+
+            # Build DB URL using the 'maas' database (maas user cannot CREATE DATABASE)
+            PG_FQDN="postgres.${MLFLOW_NS}.svc.cluster.local"
+            PG_PASSWORD_ACTUAL=$(oc get deployment postgres -n "$MLFLOW_NS" \
                 -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_PASSWORD")].value}' 2>/dev/null)
-            PG_USER=$(oc get deployment postgres -n "$PG_DEPLOY_NS" \
+            PG_USER=$(oc get deployment postgres -n "$MLFLOW_NS" \
                 -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_USER")].value}' 2>/dev/null)
-            ENCODED_PW=$(printf '%s' "$PG_PASSWORD_ACTUAL" | od -An -tx1 | tr -d ' \n' | sed 's/../%&/g')
-            MLFLOW_DB_URL="postgresql://${PG_USER}:${ENCODED_PW}@${PG_FQDN}:5432/mlflow?sslmode=disable"
+            ENCODED_PW=$(printf '%s' "$PG_PASSWORD_ACTUAL" | python3 -c \
+                "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=''))")
+            MLFLOW_DB_URL="postgresql://${PG_USER}:${ENCODED_PW}@${PG_FQDN}:5432/maas?sslmode=disable"
 
-            oc create secret generic mlflow-db-credentials \
-                --from-literal=database-url="$MLFLOW_DB_URL" \
-                --dry-run=client -o yaml | oc apply -f - 2>/dev/null
+            # Ensure mlflow-db-credentials secret exists (idempotent)
+            if oc get secret mlflow-db-credentials -n "$MLFLOW_NS" &>/dev/null; then
+                success "mlflow-db-credentials secret ✓"
+            else
+                oc create secret generic mlflow-db-credentials \
+                    --from-literal=database-url="$MLFLOW_DB_URL" \
+                    -n "$MLFLOW_NS" --dry-run=client -o yaml | oc apply -f - 2>/dev/null
+                success "mlflow-db-credentials secret created"
+            fi
+        else
+            warn "PostgreSQL not ready after 60s — falling back to SQLite for MLflow"
+        fi
+    fi
 
-            oc apply -f - <<EOF
+    # --- MLflow CR: create or recover ---
+    if oc get mlflow mlflow &>/dev/null 2>&1; then
+        MLFLOW_AVAILABLE=$(oc get mlflow mlflow \
+            -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+
+        if [ "$MLFLOW_AVAILABLE" = "True" ]; then
+            success "MLflow server running ✓"
+        else
+            # Detect stuck migration job (CreateContainerConfigError / Error)
+            STUCK_POD=$(oc get pods -n "$MLFLOW_NS" --no-headers 2>/dev/null \
+                | grep -E "mlflow-mg.*(CreateContainerConfigError|Error|ImagePullBackOff)" \
+                | awk '{print $1}' | head -1)
+            if [ -n "$STUCK_POD" ]; then
+                # Extract job name from pod name (strip trailing pod hash)
+                JOB_NAME=$(echo "$STUCK_POD" | rev | cut -d'-' -f2- | rev)
+                warn "Stuck migration job detected ($JOB_NAME) — deleting for retry..."
+                oc delete job "$JOB_NAME" -n "$MLFLOW_NS" 2>/dev/null || true
+                info "Waiting for MLflow to reconcile (up to 120s)..."
+                WAIT=0
+                while [ $WAIT -lt 120 ]; do
+                    MLFLOW_AVAILABLE=$(oc get mlflow mlflow \
+                        -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+                    [ "$MLFLOW_AVAILABLE" = "True" ] && break
+                    sleep 10; WAIT=$((WAIT + 10))
+                done
+                [ "$MLFLOW_AVAILABLE" = "True" ] && success "MLflow server recovered ✓" || \
+                    warn "MLflow not ready yet (will reconcile in background)"
+            else
+                warn "MLflow exists but not Available — will reconcile in background"
+            fi
+        fi
+    else
+        # First-time MLflow CR creation
+        if [ "$MLFLOW_BACKEND" = "postgres" ]; then
+            oc apply -f - <<'EOF'
 apiVersion: mlflow.opendatahub.io/v1
 kind: MLflow
 metadata:
@@ -361,7 +445,7 @@ spec:
 EOF
             success "MLflow created (PostgreSQL backend)"
         else
-            info "No PostgreSQL found — using SQLite with PVC..."
+            info "No PostgreSQL available — using SQLite with PVC..."
             oc apply -f - <<'EOF'
 apiVersion: mlflow.opendatahub.io/v1
 kind: MLflow
