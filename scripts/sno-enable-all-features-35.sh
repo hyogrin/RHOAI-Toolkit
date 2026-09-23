@@ -477,6 +477,110 @@ else
 fi
 echo ""
 
+# --- EvalHub (TrustyAI Operator CR) ---
+# EvalHub is deployed centrally in redhat-ods-applications.
+# RBAC grants are created per project namespace (demo).
+EVALHUB_NS="redhat-ods-applications"
+
+if oc get crd evalhubs.trustyai.opendatahub.io &>/dev/null 2>&1; then
+    success "EvalHub CRD registered ✓"
+
+    if oc get evalhub evalhub -n "$EVALHUB_NS" &>/dev/null 2>&1; then
+        success "EvalHub already exists in $EVALHUB_NS ✓"
+    else
+        # SQLite is sufficient for demo SNO — no DB secrets or RBAC to PostgreSQL needed.
+        # PostgreSQL is deployed later by sno-setup-maas-35.sh, so it won't exist here anyway.
+        info "Creating EvalHub (SQLite backend — lightweight for demo)..."
+        oc apply -f - <<EOF
+apiVersion: trustyai.opendatahub.io/v1alpha1
+kind: EvalHub
+metadata:
+  name: evalhub
+  namespace: ${EVALHUB_NS}
+spec:
+  replicas: 1
+  database:
+    type: sqlite
+  providers:
+    - lm-evaluation-harness
+    - garak
+    - guidellm
+    - lighteval
+  collections:
+    - leaderboard-v2
+    - safety-and-fairness-v1
+EOF
+        success "EvalHub created (SQLite backend)"
+
+        # Wait for EvalHub
+        info "Waiting for EvalHub..."
+        WAIT=0
+        while [ $WAIT -lt 120 ]; do
+            EVALHUB_PHASE=$(oc get evalhub evalhub -n "$EVALHUB_NS" \
+                -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            [ "$EVALHUB_PHASE" = "Ready" ] && { success "EvalHub ready ✓"; break; }
+            sleep 10; WAIT=$((WAIT + 10))
+        done
+        [ "${EVALHUB_PHASE:-}" != "Ready" ] && warn "EvalHub not ready yet (will reconcile in background)"
+    fi
+
+    # RBAC: grant EvalHub access to demo project
+    info "Configuring EvalHub RBAC for demo namespace..."
+    oc apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: evalhub-central-mlflow-access
+  namespace: demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: trustyai-service-operator-evalhub-mlflow-access
+subjects:
+- kind: ServiceAccount
+  name: evalhub-service
+  namespace: ${EVALHUB_NS}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: evalhub-central-jobs-writer
+  namespace: demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: trustyai-service-operator-evalhub-jobs-writer
+subjects:
+- kind: ServiceAccount
+  name: evalhub-service
+  namespace: ${EVALHUB_NS}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: evalhub-central-job-config
+  namespace: demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: trustyai-service-operator-evalhub-job-config
+subjects:
+- kind: ServiceAccount
+  name: evalhub-service
+  namespace: ${EVALHUB_NS}
+EOF
+
+    # Create eval job ServiceAccount for demo namespace
+    oc create sa "evalhub-${EVALHUB_NS}-job" -n demo 2>/dev/null || true
+    oc adm policy add-role-to-user edit \
+        "system:serviceaccount:demo:evalhub-${EVALHUB_NS}-job" -n demo 2>/dev/null || true
+
+    success "EvalHub RBAC configured for demo namespace"
+else
+    warn "EvalHub CRD not available yet — EvalHub will be created on next run"
+fi
+echo ""
+
 ###############################################################################
 # Step 4/8: MaaS Gateway
 #   Creates GatewayClass + Gateway CRs. These are just API objects — they
@@ -931,6 +1035,13 @@ for PLUGIN_NAME in kuadrant-console-plugin console-dashboards-plugin monitoring-
         echo "  ⬚  ${PLUGIN_NAME}"
     fi
 done
+
+echo ""
+info "Services:"
+MLFLOW_READY=$(oc get mlflow mlflow -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+[ "$MLFLOW_READY" = "True" ] && echo "  ✅ MLflow server" || echo "  ⬚  MLflow server"
+EVALHUB_PHASE=$(oc get evalhub evalhub -n redhat-ods-applications -o jsonpath='{.status.phase}' 2>/dev/null || true)
+[ "$EVALHUB_PHASE" = "Ready" ] && echo "  ✅ EvalHub" || echo "  ⬚  EvalHub (${EVALHUB_PHASE:-not deployed})"
 
 echo ""
 info "Gateway:"
