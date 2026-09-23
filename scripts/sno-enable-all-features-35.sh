@@ -378,8 +378,15 @@ PGPVC
                 -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_PASSWORD")].value}' 2>/dev/null)
             PG_USER=$(oc get deployment postgres -n "$MLFLOW_NS" \
                 -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_USER")].value}' 2>/dev/null)
-            ENCODED_PW=$(printf '%s' "$PG_PASSWORD_ACTUAL" | python3 -c \
-                "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=''))")
+            # URL-encode password (pure bash — no python3 in Web Terminal)
+            ENCODED_PW=""
+            for (( _i=0; _i<${#PG_PASSWORD_ACTUAL}; _i++ )); do
+                _c="${PG_PASSWORD_ACTUAL:$_i:1}"
+                case "$_c" in
+                    [a-zA-Z0-9.~_-]) ENCODED_PW+="$_c" ;;
+                    *) ENCODED_PW+=$(printf '%%%02X' "'$_c") ;;
+                esac
+            done
             MLFLOW_DB_URL="postgresql://${PG_USER}:${ENCODED_PW}@${PG_FQDN}:5432/maas?sslmode=disable"
 
             # Ensure mlflow-db-credentials secret exists (idempotent)
