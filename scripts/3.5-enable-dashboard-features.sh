@@ -149,8 +149,8 @@ wait_for_dashboard_config() {
 }
 
 ensure_dsci_observability() {
-    # DSCI monitoring.metrics.storage가 비어있으면 Perses/MonitoringStack이 동작하지 않음
-    # → Observe & Monitor 대시보드가 "No datasource found" 에러를 표시
+    # If DSCI monitoring.metrics.storage is empty, Perses/MonitoringStack won't start
+    # → Observe & Monitor dashboard shows "No datasource found" error
     local metrics_size
     metrics_size=$(oc get dscinitialization default-dsci \
         -o jsonpath='{.spec.monitoring.metrics.storage.size}' 2>/dev/null)
@@ -159,7 +159,7 @@ ensure_dsci_observability() {
         return 0
     fi
 
-    print_step "DSCI Observability 설정 (metrics/traces storage)..."
+    print_step "Configuring DSCI Observability (metrics/traces storage)..."
     if oc patch dscinitialization default-dsci --type=merge -p '{
       "spec": {
         "monitoring": {
@@ -183,9 +183,9 @@ ensure_dsci_observability() {
         }
       }
     }' 2>/dev/null; then
-        print_success "DSCI metrics/traces 설정 완료"
+        print_success "DSCI metrics/traces configured"
     else
-        print_warning "DSCI 패치 실패 — 수동으로 설정이 필요할 수 있습니다"
+        print_warning "DSCI patch failed — may need manual configuration"
     fi
 }
 

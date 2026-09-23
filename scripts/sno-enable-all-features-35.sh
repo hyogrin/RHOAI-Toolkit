@@ -2,12 +2,25 @@
 ###############################################################################
 # sno-enable-all-features.sh
 #
-# Enable all RHOAI 3.5 DSC components + dashboard features on an SNO cluster
-# in a single run.
+# Enable all RHOAI 3.5 DSC components + dashboard features on an SNO cluster.
+#
+# Execution order is optimized for Web Terminal reliability:
+#   Steps 1-5  — Core configuration (safe, no network disruption)
+#   Step 6     — Operator install (may briefly disrupt Web Terminal)
+#   Step 7     — Verification (best effort)
+#
+# Steps 1-5 complete before any network disruption caused by RHCL/Service
+# Mesh installation. If the terminal disconnects during Step 6, operators
+# continue installing via OLM in the background. Re-run the script to
+# pick up where it left off — all steps are idempotent.
 #
 # Usage:
-#   bash sno-enable-all-features.sh                # Auto-install missing operators + enable all
-#   bash sno-enable-all-features.sh --skip-install  # Skip operator install (config only)
+#   bash sno-enable-all-features.sh                 # Full run (recommended)
+#   bash sno-enable-all-features.sh --skip-install   # Skip operator install
+#
+# Tip: In Web Terminal, run with nohup to survive disconnections:
+#   nohup bash sno-enable-all-features.sh > /tmp/sno.log 2>&1 &
+#   # Reconnect later:  tail -f /tmp/sno.log
 #
 # Prerequisites:
 #   - oc login completed
@@ -25,9 +38,20 @@ success() { echo -e "${GREEN}[OK]${NC}   $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERR]${NC}  $*"; }
 
+# Operator definitions (used in Steps 6 and 7)
+declare -a OP_NAMES=( "RHCL (Red Hat Connectivity Link)" "OpenTelemetry"                    "Tempo"                    "COO (Cluster Observability)" )
+declare -a OP_NS=(    "redhat-connectivity-link-operator" "openshift-opentelemetry-operator" "openshift-tempo-operator" "openshift-cluster-observability-operator" )
+declare -a OP_GREP=(  "rhcl-operator"                     "opentelemetry"                    "tempo"                    "cluster-observability-operator" )
+declare -a OP_SUB=(   "rhcl-operator"                     "opentelemetry-product"            "tempo-product"            "cluster-observability-operator" )
+declare -a OP_CH=(    "stable-v1"                         "stable"                           "stable"                   "stable" )
+declare -a OP_USE=(   "MaaS / AIGateway"                  "Metrics & trace collection"       "Distributed trace store"  "Observe & Monitor dashboard (Perses)" )
+
 echo "=============================================="
 echo " RHOAI 3.5 SNO — Enable All Features"
 echo "=============================================="
+echo ""
+info "Order: Config (Steps 1-5) → Operators (Step 6) → Verify (Step 7)"
+info "Steps 1-5 complete before any network disruption."
 echo ""
 
 ###############################################################################
@@ -68,33 +92,22 @@ spec:
 EOF
 }
 
-wait_for_operators() {
-    local TIMEOUT="${1:-240}"
-    local WAIT=0
-    info "Waiting for operators (up to $((TIMEOUT/60))min)..."
-    while [ $WAIT -lt "$TIMEOUT" ]; do
-        local ALL_READY=true
-        for i in "${!MISSING_NS[@]}"; do
-            if ! oc get csv -n "${MISSING_NS[$i]}" 2>/dev/null | grep -q "${MISSING_GREP[$i]}.*Succeeded"; then
-                ALL_READY=false
-            fi
-        done
-        $ALL_READY && break
-        sleep 10; WAIT=$((WAIT + 10))
-    done
-    for i in "${!MISSING_NAMES[@]}"; do
-        if oc get csv -n "${MISSING_NS[$i]}" 2>/dev/null | grep -q "${MISSING_GREP[$i]}.*Succeeded"; then
-            success "${MISSING_NAMES[$i]} ✓"
-        else
-            warn "${MISSING_NAMES[$i]} — still installing (continues in background)"
-        fi
-    done
+###############################################################################
+# Helper: check if an operator is installed
+###############################################################################
+check_operator_installed() {
+    local idx="$1"
+    if [ "${OP_SUB[$idx]}" = "rhcl-operator" ]; then
+        oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator"
+    else
+        oc get csv -n "${OP_NS[$idx]}" --no-headers 2>/dev/null | grep -q "${OP_GREP[$idx]}.*Succeeded"
+    fi
 }
 
 ###############################################################################
 # Phase 1: Required prerequisites (abort if missing)
 ###############################################################################
-info "=== Phase 1: Required prerequisites ==="
+info "=== Prerequisites ==="
 
 if ! oc whoami &>/dev/null; then
     error "oc login required"
@@ -118,103 +131,10 @@ success "DSC: default-dsc"
 echo ""
 
 ###############################################################################
-# Phase 2: Additional operators — check & auto-install if missing
+# Step 1/7: User Workload Monitoring + DSCI Observability
+#   Required for Observe & Monitor dashboard (Perses / MonitoringStack)
 ###############################################################################
-info "=== Phase 2: Additional operator scan ==="
-
-declare -a OP_NAMES=( "RHCL (Red Hat Connectivity Link)" "OpenTelemetry"                    "Tempo"                    "COO (Cluster Observability)" )
-declare -a OP_NS=(    "redhat-connectivity-link-operator" "openshift-opentelemetry-operator" "openshift-tempo-operator" "openshift-cluster-observability-operator" )
-declare -a OP_GREP=(  "rhcl-operator"                     "opentelemetry"                    "tempo"                    "cluster-observability-operator" )
-declare -a OP_SUB=(   "rhcl-operator"                     "opentelemetry-product"            "tempo-product"            "cluster-observability-operator" )
-declare -a OP_CH=(    "stable-v1"                         "stable"                           "stable"                   "stable" )
-declare -a OP_USE=(   "MaaS / AIGateway"                  "Metrics & trace collection"       "Distributed trace store"  "Observe & Monitor dashboard (Perses)" )
-
-declare -a MISSING_NAMES=()
-declare -a MISSING_NS=()
-declare -a MISSING_GREP=()
-declare -a MISSING_IDX=()
-
-for i in "${!OP_NAMES[@]}"; do
-    FOUND=false
-    if [ "${OP_SUB[$i]}" = "rhcl-operator" ]; then
-        # RHCL may run in AllNamespaces mode — check Subscription instead of CSV
-        oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator" && FOUND=true
-    else
-        oc get csv -n "${OP_NS[$i]}" --no-headers 2>/dev/null | grep -q "${OP_GREP[$i]}.*Succeeded" && FOUND=true
-    fi
-    if $FOUND; then
-        success "${OP_NAMES[$i]} ✓"
-        continue
-    fi
-    warn "${OP_NAMES[$i]} — not installed  (needed for: ${OP_USE[$i]})"
-    MISSING_NAMES+=("${OP_NAMES[$i]}")
-    MISSING_NS+=("${OP_NS[$i]}")
-    MISSING_GREP+=("${OP_GREP[$i]}")
-    MISSING_IDX+=("$i")
-done
-
-echo ""
-
-if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
-    echo -e "${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${BOLD}│  ${#MISSING_NAMES[@]} operator(s) not installed                          │${NC}"
-    echo -e "${BOLD}├─────────────────────────────────────────────────────────┤${NC}"
-    for j in "${!MISSING_NAMES[@]}"; do
-        printf "${BOLD}│${NC}  %-3s %-30s → %s\n" "$((j+1))." "${MISSING_NAMES[$j]}" "${OP_USE[${MISSING_IDX[$j]}]}"
-    done
-    echo -e "${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
-
-    if [ "$SKIP_INSTALL" = true ]; then
-        warn "Skipping operator install (--skip-install)"
-        warn "Some features may not work without these operators"
-        echo -e "  Install manually: Console → Operators → OperatorHub"
-        CONSOLE_URL=$(oc whoami --show-console 2>/dev/null || echo "")
-        [ -n "$CONSOLE_URL" ] && echo -e "  ${CYAN}${CONSOLE_URL}/operatorhub${NC}"
-        echo ""
-    else
-        info "Auto-installing missing operators..."
-        echo ""
-        for j in "${!MISSING_IDX[@]}"; do
-            idx=${MISSING_IDX[$j]}
-            install_operator "${OP_NAMES[$idx]}" "${OP_NS[$idx]}" "${OP_SUB[$idx]}" "${OP_CH[$idx]}"
-        done
-        echo ""
-        wait_for_operators 240
-    fi
-else
-    success "All additional operators installed ✓"
-fi
-
-# UIPlugins (requires COO)
-if oc get crd uiplugins.observability.openshift.io &>/dev/null 2>&1; then
-    info "Configuring UIPlugins..."
-    oc apply -f - <<'EOF'
-apiVersion: observability.openshift.io/v1alpha1
-kind: UIPlugin
-metadata:
-  name: dashboards
-spec:
-  type: Dashboards
----
-apiVersion: observability.openshift.io/v1alpha1
-kind: UIPlugin
-metadata:
-  name: monitoring
-spec:
-  type: Monitoring
-  monitoring:
-    perses:
-      enabled: true
-EOF
-    success "UIPlugins (dashboards + monitoring) configured"
-fi
-echo ""
-
-###############################################################################
-# Step 1. User Workload Monitoring + DSCI Observability
-#         Required for GPUaaS dashboard and Observe & Monitor menu
-###############################################################################
-info "=== Step 1/6: User Workload Monitoring + DSCI Observability ==="
+info "=== Step 1/7: User Workload Monitoring + DSCI Observability ==="
 
 if oc get configmap cluster-monitoring-config -n openshift-monitoring &>/dev/null 2>&1; then
     EXISTING=$(oc get configmap cluster-monitoring-config -n openshift-monitoring \
@@ -249,14 +169,14 @@ EOF
     success "User Workload Monitoring enabled"
 fi
 
-# Wait for monitoring pods
+# Brief wait for monitoring pods
 WAIT=0
 while [ "$(oc get pods -n openshift-user-workload-monitoring --no-headers 2>/dev/null | grep -c Running)" -lt 2 ]; do
     [ $WAIT -ge 60 ] && { warn "Monitoring pods wait timeout (continuing)"; break; }
     sleep 5; WAIT=$((WAIT + 5))
 done
 
-# DSCI monitoring metrics/traces config (required for Observe & Monitor dashboard)
+# DSCI monitoring metrics/traces config
 # Without metrics.storage, Perses/MonitoringStack will not start
 info "Configuring DSCI observability..."
 METRICS_CONFIGURED=$(oc get dscinitialization default-dsci \
@@ -290,8 +210,9 @@ else
     success "DSCI metrics/traces configured"
 fi
 
-# Wait for MonitoringStack
+# Wait for MonitoringStack (best effort — may not be ready without COO)
 info "Waiting for MonitoringStack..."
+MON_STATUS=""
 WAIT=0
 while [ $WAIT -lt 120 ]; do
     MON_STATUS=$(oc get dscinitialization default-dsci \
@@ -299,14 +220,13 @@ while [ $WAIT -lt 120 ]; do
     [ "$MON_STATUS" = "True" ] && { success "MonitoringStack ✓"; break; }
     sleep 10; WAIT=$((WAIT + 10))
 done
-[ "$MON_STATUS" != "True" ] && warn "MonitoringStack not ready yet (continuing)"
+[ "${MON_STATUS:-}" != "True" ] && warn "MonitoringStack not ready yet (will reconcile in background)"
 echo ""
 
 ###############################################################################
-# Step 2. DSC patch — enable backend components
-#         mlflowoperator / ogx / aigateway+MaaS / llamastackoperator Removed
+# Step 2/7: DSC component activation
 ###############################################################################
-info "=== Step 2/6: DSC component activation ==="
+info "=== Step 2/7: DSC component activation ==="
 
 oc patch datasciencecluster default-dsc --type=merge -p '{
   "spec": {
@@ -343,10 +263,12 @@ oc get crd ogxservers.ogx.io &>/dev/null 2>&1 && success "OGX CRD registered ✓
 echo ""
 
 ###############################################################################
-# Step 3. MaaS Gateway
-#         Required after AIGateway is enabled
+# Step 3/7: MaaS Gateway
+#   Creates GatewayClass + Gateway CRs. These are just API objects — they
+#   don't require RHCL to be running yet. The gateway controller will
+#   reconcile them once RHCL/Service Mesh is ready.
 ###############################################################################
-info "=== Step 3/6: MaaS Gateway ==="
+info "=== Step 3/7: MaaS Gateway ==="
 
 CLUSTER_DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')
 
@@ -405,9 +327,9 @@ fi
 echo ""
 
 ###############################################################################
-# Step 4. OdhDashboardConfig — enable all dashboard menus
+# Step 4/7: Dashboard menu activation
 ###############################################################################
-info "=== Step 4/6: Dashboard menu activation ==="
+info "=== Step 4/7: Dashboard menu activation ==="
 
 WAIT=0
 while ! oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications &>/dev/null; do
@@ -464,9 +386,9 @@ success "Dashboard menu patched"
 echo ""
 
 ###############################################################################
-# Step 5. Restart dashboard
+# Step 5/7: Dashboard restart
 ###############################################################################
-info "=== Step 5/6: Dashboard restart ==="
+info "=== Step 5/7: Dashboard restart ==="
 oc rollout restart deployment/rhods-dashboard -n redhat-ods-applications 2>/dev/null || true
 info "Restarting (1-2 min)..."
 sleep 10
@@ -475,10 +397,122 @@ oc rollout status deployment/rhods-dashboard -n redhat-ods-applications --timeou
 success "Dashboard restarted"
 echo ""
 
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+success "Core configuration complete (Steps 1-5)."
+info "Next: operator install (Step 6) may briefly disrupt Web Terminal."
+info "If disconnected, re-run this script — completed steps are skipped."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
 ###############################################################################
-# Step 6. Verification
+# Step 6/7: Operator scan & install
+#   RHCL installation triggers Service Mesh 3, which may briefly disrupt
+#   the OpenShift ingress layer and Web Terminal connections.
+#   Even if the terminal disconnects, OLM continues the installation.
 ###############################################################################
-info "=== Step 6/6: Verification ==="
+info "=== Step 6/7: Operator scan & install ==="
+
+declare -a MISSING_NAMES=()
+declare -a MISSING_NS=()
+declare -a MISSING_GREP=()
+declare -a MISSING_IDX=()
+
+for i in "${!OP_NAMES[@]}"; do
+    if check_operator_installed "$i"; then
+        success "${OP_NAMES[$i]} ✓"
+    else
+        warn "${OP_NAMES[$i]} — not installed  (needed for: ${OP_USE[$i]})"
+        MISSING_NAMES+=("${OP_NAMES[$i]}")
+        MISSING_NS+=("${OP_NS[$i]}")
+        MISSING_GREP+=("${OP_GREP[$i]}")
+        MISSING_IDX+=("$i")
+    fi
+done
+
+echo ""
+
+if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
+    echo -e "${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}│  ${#MISSING_NAMES[@]} operator(s) not installed                          │${NC}"
+    echo -e "${BOLD}├─────────────────────────────────────────────────────────┤${NC}"
+    for j in "${!MISSING_NAMES[@]}"; do
+        printf "${BOLD}│${NC}  %-3s %-30s → %s\n" "$((j+1))." "${MISSING_NAMES[$j]}" "${OP_USE[${MISSING_IDX[$j]}]}"
+    done
+    echo -e "${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
+
+    if [ "$SKIP_INSTALL" = true ]; then
+        warn "Skipping operator install (--skip-install)"
+        warn "Some features may not work without these operators"
+        echo -e "  Install manually: Console → Operators → OperatorHub"
+        CONSOLE_URL=$(oc whoami --show-console 2>/dev/null || echo "")
+        [ -n "$CONSOLE_URL" ] && echo -e "  ${CYAN}${CONSOLE_URL}/operatorhub${NC}"
+        echo ""
+    else
+        info "Auto-installing missing operators..."
+        info "RHCL triggers Service Mesh — Web Terminal may briefly disconnect."
+        echo ""
+        for j in "${!MISSING_IDX[@]}"; do
+            idx=${MISSING_IDX[$j]}
+            install_operator "${OP_NAMES[$idx]}" "${OP_NS[$idx]}" "${OP_SUB[$idx]}" "${OP_CH[$idx]}"
+        done
+        echo ""
+
+        # Wait for operators (best effort — OLM handles it regardless)
+        info "Waiting for operators (up to 4min)..."
+        TIMEOUT=240; WAIT=0
+        while [ $WAIT -lt "$TIMEOUT" ]; do
+            ALL_READY=true
+            for i in "${!MISSING_NS[@]}"; do
+                if ! oc get csv -n "${MISSING_NS[$i]}" 2>/dev/null | grep -q "${MISSING_GREP[$i]}.*Succeeded"; then
+                    ALL_READY=false
+                fi
+            done
+            $ALL_READY && break
+            sleep 10; WAIT=$((WAIT + 10))
+        done
+        for i in "${!MISSING_NAMES[@]}"; do
+            if oc get csv -n "${MISSING_NS[$i]}" 2>/dev/null | grep -q "${MISSING_GREP[$i]}.*Succeeded"; then
+                success "${MISSING_NAMES[$i]} ✓"
+            else
+                warn "${MISSING_NAMES[$i]} — still installing (continues in background)"
+            fi
+        done
+    fi
+else
+    success "All additional operators installed ✓"
+fi
+
+# UIPlugins (requires COO)
+if oc get crd uiplugins.observability.openshift.io &>/dev/null 2>&1; then
+    info "Configuring UIPlugins..."
+    oc apply -f - <<'EOF'
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: dashboards
+spec:
+  type: Dashboards
+---
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: monitoring
+spec:
+  type: Monitoring
+  monitoring:
+    perses:
+      enabled: true
+EOF
+    success "UIPlugins (dashboards + monitoring) configured"
+else
+    warn "COO not ready yet — UIPlugins will be configured on next run"
+fi
+echo ""
+
+###############################################################################
+# Step 7/7: Verification
+###############################################################################
+info "=== Step 7/7: Verification ==="
 info "DSC components:"
 for comp in MLflowOperatorReady OGXReady AIGatewayReady KserveReady TrustyAIReady AIPipelinesReady DashboardReady WorkbenchesReady ModelsAsAServiceReady; do
     STATUS=$(oc get datasciencecluster default-dsc -o jsonpath="{.status.conditions[?(@.type==\"${comp}\")].status}" 2>/dev/null)
@@ -493,14 +527,21 @@ done
 echo ""
 info "Operators:"
 for i in "${!OP_NAMES[@]}"; do
-    OP_OK=false
-    if [ "${OP_SUB[$i]}" = "rhcl-operator" ]; then
-        oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator" && OP_OK=true
+    if check_operator_installed "$i"; then
+        echo "  ✅ ${OP_NAMES[$i]}"
     else
-        oc get csv -n "${OP_NS[$i]}" --no-headers 2>/dev/null | grep -q "${OP_GREP[$i]}.*Succeeded" && OP_OK=true
+        echo "  ⬚  ${OP_NAMES[$i]}"
     fi
-    $OP_OK && echo "  ✅ ${OP_NAMES[$i]}" || echo "  ⬚  ${OP_NAMES[$i]}"
 done
+
+echo ""
+info "Observability:"
+MON_STATUS=$(oc get dscinitialization default-dsci \
+  -o jsonpath='{.status.conditions[?(@.type=="MonitoringStackAvailable")].status}' 2>/dev/null)
+PERSES_STATUS=$(oc get dscinitialization default-dsci \
+  -o jsonpath='{.status.conditions[?(@.type=="PersesAvailable")].status}' 2>/dev/null)
+[ "${MON_STATUS:-}" = "True" ] && echo "  ✅ MonitoringStack" || echo "  ⬚  MonitoringStack"
+[ "${PERSES_STATUS:-}" = "True" ] && echo "  ✅ Perses" || echo "  ⬚  Perses"
 
 echo ""
 info "Gateway:"
@@ -518,4 +559,7 @@ success "Done! Refresh the dashboard."
 echo ""
 echo "  * If MaaS shows NotReady, run the MaaS setup:"
 echo "    bash scripts/sno-setup-maas-35.sh"
+echo ""
+echo "  * If some operators show ⬚, re-run this script."
+echo "    Operators installed by OLM continue in the background."
 echo "=============================================="

@@ -345,29 +345,37 @@ EOF
             -n "$AUTHORINO_NS"
     fi
 
-    # Patch Limitador for redis-cached storage
-    CURRENT_STORAGE=$(oc get limitador limitador -n "$AUTHORINO_NS" \
-        -o jsonpath='{.spec.storage.redis-cached}' 2>/dev/null || true)
-    if [ -z "$CURRENT_STORAGE" ]; then
-        info "Configuring Limitador with redis-cached storage..."
-        oc patch limitador limitador -n "$AUTHORINO_NS" --type=merge -p '{
-            "spec": {
-                "storage": {
-                    "redis-cached": {
-                        "configSecretRef": { "name": "limitador-redis-config" },
-                        "options": {
-                            "flush-period": 500,
-                            "max-cached": 10000,
-                            "batch-size": 100,
-                            "response-timeout": 500
+    # Patch Limitador for redis-cached storage (CRD may not exist in all versions)
+    if oc get crd limitadors.limitador.kuadrant.io &>/dev/null 2>&1; then
+        CURRENT_STORAGE=$(oc get limitador limitador -n "$AUTHORINO_NS" \
+            -o jsonpath='{.spec.storage.redis-cached}' 2>/dev/null || true)
+        if [ -z "$CURRENT_STORAGE" ]; then
+            info "Configuring Limitador with redis-cached storage..."
+            if oc patch limitador limitador -n "$AUTHORINO_NS" --type=merge -p '{
+                "spec": {
+                    "storage": {
+                        "redis-cached": {
+                            "configSecretRef": { "name": "limitador-redis-config" },
+                            "options": {
+                                "flush-period": 500,
+                                "max-cached": 10000,
+                                "batch-size": 100,
+                                "response-timeout": 500
+                            }
                         }
                     }
                 }
-            }
-        }'
-        success "Limitador configured with Redis"
+            }' 2>/dev/null; then
+                success "Limitador configured with Redis"
+            else
+                warn "Could not patch Limitador — rate limiting may use in-memory storage"
+            fi
+        else
+            success "Limitador already using redis-cached ✓"
+        fi
     else
-        success "Limitador already using redis-cached ✓"
+        warn "Limitador CRD not found — skipping redis-cached config"
+        warn "Rate limiting may be managed differently in this RHOAI version"
     fi
 
     # Health check interceptor EnvoyFilter
