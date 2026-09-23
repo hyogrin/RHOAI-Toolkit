@@ -2,17 +2,17 @@
 ###############################################################################
 # sno-enable-all-features.sh
 #
-# RHOAI 3.5 SNO(Single Node OpenShift) 클러스터에서
-# 모든 DSC 컴포넌트 + Dashboard 메뉴를 한번에 활성화하는 스크립트
+# Enable all RHOAI 3.5 DSC components + dashboard features on an SNO cluster
+# in a single run.
 #
-# 사용법:
-#   bash sno-enable-all-features.sh              # 누락 Operator 자동 설치 + 전체 활성화
-#   bash sno-enable-all-features.sh --skip-install  # Operator 설치 건너뛰기 (설정만)
+# Usage:
+#   bash sno-enable-all-features.sh                # Auto-install missing operators + enable all
+#   bash sno-enable-all-features.sh --skip-install  # Skip operator install (config only)
 #
-# 사전조건:
-#   - oc login 완료
-#   - RHOAI 3.5.x Operator 설치 완료
-#   - DataScienceCluster 'default-dsc' 존재
+# Prerequisites:
+#   - oc login completed
+#   - RHOAI 3.5.x Operator installed
+#   - DataScienceCluster 'default-dsc' exists
 ###############################################################################
 set -euo pipefail
 
@@ -31,7 +31,7 @@ echo "=============================================="
 echo ""
 
 ###############################################################################
-# Helper: Operator 설치 & 대기 함수
+# Helper: install operator via Subscription
 ###############################################################################
 install_operator() {
     local DISPLAY_NAME="$1"
@@ -39,7 +39,7 @@ install_operator() {
     local SUB_NAME="$3"
     local CHANNEL="${4:-stable}"
 
-    info "${DISPLAY_NAME} 설치 중..."
+    info "Installing ${DISPLAY_NAME}..."
     oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
@@ -71,7 +71,7 @@ EOF
 wait_for_operators() {
     local TIMEOUT="${1:-240}"
     local WAIT=0
-    info "Operators 설치 대기 중 (최대 $((TIMEOUT/60))분)..."
+    info "Waiting for operators (up to $((TIMEOUT/60))min)..."
     while [ $WAIT -lt "$TIMEOUT" ]; do
         local ALL_READY=true
         for i in "${!MISSING_NS[@]}"; do
@@ -82,57 +82,52 @@ wait_for_operators() {
         $ALL_READY && break
         sleep 10; WAIT=$((WAIT + 10))
     done
-    # Report results
     for i in "${!MISSING_NAMES[@]}"; do
         if oc get csv -n "${MISSING_NS[$i]}" 2>/dev/null | grep -q "${MISSING_GREP[$i]}.*Succeeded"; then
             success "${MISSING_NAMES[$i]} ✓"
         else
-            warn "${MISSING_NAMES[$i]} — 아직 설치 중 (백그라운드에서 계속 진행됩니다)"
+            warn "${MISSING_NAMES[$i]} — still installing (continues in background)"
         fi
     done
 }
 
 ###############################################################################
-# Phase 1: 필수 사전조건 체크 (없으면 중단)
+# Phase 1: Required prerequisites (abort if missing)
 ###############################################################################
-info "=== Phase 1: 필수 사전조건 체크 ==="
+info "=== Phase 1: Required prerequisites ==="
 
-# oc login
 if ! oc whoami &>/dev/null; then
-    error "oc login이 필요합니다"
+    error "oc login required"
     exit 1
 fi
 success "Logged in: $(oc whoami) @ $(oc whoami --show-server)"
 
-# RHOAI Operator
 RHOAI_CSV=$(oc get csv -n redhat-ods-operator --no-headers 2>/dev/null | grep rhods | awk '{print $1}')
 if [ -z "$RHOAI_CSV" ]; then
-    error "RHOAI Operator가 설치되어 있지 않습니다"
-    echo "  → OperatorHub에서 'Red Hat OpenShift AI' 설치 후 재실행하세요"
+    error "RHOAI Operator not installed"
+    echo "  → Install 'Red Hat OpenShift AI' from OperatorHub first"
     exit 1
 fi
 success "RHOAI: $(echo "$RHOAI_CSV" | sed 's/rhods-operator\.//')"
 
-# DSC
 if ! oc get datasciencecluster default-dsc &>/dev/null; then
-    error "DataScienceCluster 'default-dsc'가 존재하지 않습니다"
+    error "DataScienceCluster 'default-dsc' not found"
     exit 1
 fi
 success "DSC: default-dsc"
 echo ""
 
 ###############################################################################
-# Phase 2: 추가 Operator 체크 (없으면 안내 + 설치 여부 질문)
+# Phase 2: Additional operators — check & auto-install if missing
 ###############################################################################
-info "=== Phase 2: 추가 Operator 상태 스캔 ==="
+info "=== Phase 2: Additional operator scan ==="
 
-# Operator 목록: DISPLAY_NAME | NAMESPACE | CSV_GREP | SUB_NAME | CHANNEL | 용도
-declare -a OP_NAMES=( "RHCL (Red Hat Connectivity Link)" "OpenTelemetry"             "Tempo"                    "COO (Cluster Observability)" )
+declare -a OP_NAMES=( "RHCL (Red Hat Connectivity Link)" "OpenTelemetry"                    "Tempo"                    "COO (Cluster Observability)" )
 declare -a OP_NS=(    "redhat-connectivity-link-operator" "openshift-opentelemetry-operator" "openshift-tempo-operator" "openshift-cluster-observability-operator" )
-declare -a OP_GREP=(  "rhcl-operator"                     "opentelemetry"             "tempo"                    "cluster-observability-operator" )
-declare -a OP_SUB=(   "rhcl-operator"                     "opentelemetry-product"     "tempo-product"            "cluster-observability-operator" )
-declare -a OP_CH=(    "stable-v1"                         "stable"                    "stable"                   "stable" )
-declare -a OP_USE=(   "MaaS / AIGateway"                  "메트릭·트레이스 수집"       "분산 트레이스 저장"         "Observe & Monitor 대시보드 (Perses)" )
+declare -a OP_GREP=(  "rhcl-operator"                     "opentelemetry"                    "tempo"                    "cluster-observability-operator" )
+declare -a OP_SUB=(   "rhcl-operator"                     "opentelemetry-product"            "tempo-product"            "cluster-observability-operator" )
+declare -a OP_CH=(    "stable-v1"                         "stable"                           "stable"                   "stable" )
+declare -a OP_USE=(   "MaaS / AIGateway"                  "Metrics & trace collection"       "Distributed trace store"  "Observe & Monitor dashboard (Perses)" )
 
 declare -a MISSING_NAMES=()
 declare -a MISSING_NS=()
@@ -142,20 +137,16 @@ declare -a MISSING_IDX=()
 for i in "${!OP_NAMES[@]}"; do
     FOUND=false
     if [ "${OP_SUB[$i]}" = "rhcl-operator" ]; then
-        # RHCL은 AllNamespaces 모드일 수 있으므로 Subscription으로 체크 (빠름)
-        if oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator"; then
-            FOUND=true
-        fi
+        # RHCL may run in AllNamespaces mode — check Subscription instead of CSV
+        oc get subscription -A --no-headers 2>/dev/null | grep -q "rhcl-operator" && FOUND=true
     else
-        if oc get csv -n "${OP_NS[$i]}" --no-headers 2>/dev/null | grep -q "${OP_GREP[$i]}.*Succeeded"; then
-            FOUND=true
-        fi
+        oc get csv -n "${OP_NS[$i]}" --no-headers 2>/dev/null | grep -q "${OP_GREP[$i]}.*Succeeded" && FOUND=true
     fi
     if $FOUND; then
         success "${OP_NAMES[$i]} ✓"
         continue
     fi
-    warn "${OP_NAMES[$i]} — 미설치  (용도: ${OP_USE[$i]})"
+    warn "${OP_NAMES[$i]} — not installed  (needed for: ${OP_USE[$i]})"
     MISSING_NAMES+=("${OP_NAMES[$i]}")
     MISSING_NS+=("${OP_NS[$i]}")
     MISSING_GREP+=("${OP_GREP[$i]}")
@@ -164,10 +155,9 @@ done
 
 echo ""
 
-# 누락된 Operator가 있으면 설치 여부 질문
 if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
     echo -e "${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${BOLD}│  ${#MISSING_NAMES[@]}개 Operator가 설치되어 있지 않습니다               │${NC}"
+    echo -e "${BOLD}│  ${#MISSING_NAMES[@]} operator(s) not installed                          │${NC}"
     echo -e "${BOLD}├─────────────────────────────────────────────────────────┤${NC}"
     for j in "${!MISSING_NAMES[@]}"; do
         printf "${BOLD}│${NC}  %-3s %-30s → %s\n" "$((j+1))." "${MISSING_NAMES[$j]}" "${OP_USE[${MISSING_IDX[$j]}]}"
@@ -175,14 +165,14 @@ if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
     echo -e "${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
 
     if [ "$SKIP_INSTALL" = true ]; then
-        warn "Operator 설치를 건너뜁니다 (--skip-install)"
-        warn "일부 기능이 동작하지 않을 수 있습니다"
-        echo -e "  직접 설치하려면 Console → Operators → OperatorHub"
+        warn "Skipping operator install (--skip-install)"
+        warn "Some features may not work without these operators"
+        echo -e "  Install manually: Console → Operators → OperatorHub"
         CONSOLE_URL=$(oc whoami --show-console 2>/dev/null || echo "")
         [ -n "$CONSOLE_URL" ] && echo -e "  ${CYAN}${CONSOLE_URL}/operatorhub${NC}"
         echo ""
     else
-        info "누락된 Operator를 자동 설치합니다..."
+        info "Auto-installing missing operators..."
         echo ""
         for j in "${!MISSING_IDX[@]}"; do
             idx=${MISSING_IDX[$j]}
@@ -192,12 +182,12 @@ if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
         wait_for_operators 240
     fi
 else
-    success "모든 추가 Operator 설치 완료 ✓"
+    success "All additional operators installed ✓"
 fi
 
-# UIPlugins (COO가 설치된 경우)
+# UIPlugins (requires COO)
 if oc get crd uiplugins.observability.openshift.io &>/dev/null 2>&1; then
-    info "UIPlugins 설정 중..."
+    info "Configuring UIPlugins..."
     oc apply -f - <<'EOF'
 apiVersion: observability.openshift.io/v1alpha1
 kind: UIPlugin
@@ -216,15 +206,13 @@ spec:
     perses:
       enabled: true
 EOF
-    success "UIPlugins (dashboards + monitoring) 설정 완료"
+    success "UIPlugins (dashboards + monitoring) configured"
 fi
 echo ""
 
 ###############################################################################
-# Step 1. User Workload Monitoring + DSCI Observability 설정
-#         GPUaaS Dashboard / Observe & Monitor가 동작하려면:
-#         - User Workload Monitoring 활성화
-#         - DSCI monitoring.metrics/traces 설정 (storage 필수!)
+# Step 1. User Workload Monitoring + DSCI Observability
+#         Required for GPUaaS dashboard and Observe & Monitor menu
 ###############################################################################
 info "=== Step 1/6: User Workload Monitoring + DSCI Observability ==="
 
@@ -232,9 +220,9 @@ if oc get configmap cluster-monitoring-config -n openshift-monitoring &>/dev/nul
     EXISTING=$(oc get configmap cluster-monitoring-config -n openshift-monitoring \
       -o jsonpath='{.data.config\.yaml}' 2>/dev/null)
     if echo "$EXISTING" | grep -q "enableUserWorkload: true"; then
-        success "이미 활성화됨 ✓"
+        success "User Workload Monitoring already enabled ✓"
     else
-        warn "cluster-monitoring-config 존재하지만 enableUserWorkload 미설정 — 패치"
+        warn "cluster-monitoring-config exists but enableUserWorkload not set — patching"
         oc apply -f - <<'EOF'
 apiVersion: v1
 kind: ConfigMap
@@ -245,7 +233,7 @@ data:
   config.yaml: |
     enableUserWorkload: true
 EOF
-        success "활성화 완료"
+        success "User Workload Monitoring enabled"
     fi
 else
     oc apply -f - <<'EOF'
@@ -258,23 +246,23 @@ data:
   config.yaml: |
     enableUserWorkload: true
 EOF
-    success "활성화 완료"
+    success "User Workload Monitoring enabled"
 fi
 
 # Wait for monitoring pods
 WAIT=0
 while [ "$(oc get pods -n openshift-user-workload-monitoring --no-headers 2>/dev/null | grep -c Running)" -lt 2 ]; do
-    [ $WAIT -ge 60 ] && { warn "Monitoring pods 대기 timeout (계속 진행)"; break; }
+    [ $WAIT -ge 60 ] && { warn "Monitoring pods wait timeout (continuing)"; break; }
     sleep 5; WAIT=$((WAIT + 5))
 done
 
-# DSCI monitoring.metrics/traces 설정 (Observe & Monitor 대시보드 필수)
-# metrics.storage가 비어있으면 Perses/MonitoringStack이 동작하지 않음
-info "DSCI Observability 설정 중..."
+# DSCI monitoring metrics/traces config (required for Observe & Monitor dashboard)
+# Without metrics.storage, Perses/MonitoringStack will not start
+info "Configuring DSCI observability..."
 METRICS_CONFIGURED=$(oc get dscinitialization default-dsci \
   -o jsonpath='{.spec.monitoring.metrics.storage.size}' 2>/dev/null)
 if [ -n "$METRICS_CONFIGURED" ]; then
-    success "DSCI metrics 이미 설정됨 (storage: $METRICS_CONFIGURED) ✓"
+    success "DSCI metrics already configured (storage: $METRICS_CONFIGURED) ✓"
 else
     oc patch dscinitialization default-dsci --type=merge -p '{
       "spec": {
@@ -299,11 +287,11 @@ else
         }
       }
     }'
-    success "DSCI metrics/traces 설정 완료"
+    success "DSCI metrics/traces configured"
 fi
 
-# MonitoringStack 대기
-info "MonitoringStack 프로비저닝 대기 중..."
+# Wait for MonitoringStack
+info "Waiting for MonitoringStack..."
 WAIT=0
 while [ $WAIT -lt 120 ]; do
     MON_STATUS=$(oc get dscinitialization default-dsci \
@@ -311,14 +299,14 @@ while [ $WAIT -lt 120 ]; do
     [ "$MON_STATUS" = "True" ] && { success "MonitoringStack ✓"; break; }
     sleep 10; WAIT=$((WAIT + 10))
 done
-[ "$MON_STATUS" != "True" ] && warn "MonitoringStack 아직 준비 중 (계속 진행)"
+[ "$MON_STATUS" != "True" ] && warn "MonitoringStack not ready yet (continuing)"
 echo ""
 
 ###############################################################################
-# Step 2. DSC 패치 — 백엔드 컴포넌트 활성화
+# Step 2. DSC patch — enable backend components
 #         mlflowoperator / ogx / aigateway+MaaS / llamastackoperator Removed
 ###############################################################################
-info "=== Step 2/6: DSC 컴포넌트 활성화 ==="
+info "=== Step 2/6: DSC component activation ==="
 
 oc patch datasciencecluster default-dsc --type=merge -p '{
   "spec": {
@@ -342,31 +330,30 @@ oc patch datasciencecluster default-dsc --type=merge -p '{
   }
 }' 2>&1
 
-success "DSC 패치 완료"
+success "DSC patched"
 
 # Wait for OGX CRD
-info "OGX 프로비저닝 대기 중..."
+info "Waiting for OGX provisioning..."
 WAIT=0
 while ! oc get crd ogxservers.ogx.io &>/dev/null 2>&1; do
-    [ $WAIT -ge 90 ] && { warn "OGX CRD 대기 timeout (계속 진행)"; break; }
+    [ $WAIT -ge 90 ] && { warn "OGX CRD wait timeout (continuing)"; break; }
     sleep 5; WAIT=$((WAIT + 5))
 done
-oc get crd ogxservers.ogx.io &>/dev/null 2>&1 && success "OGX CRD 등록 완료 ✓"
+oc get crd ogxservers.ogx.io &>/dev/null 2>&1 && success "OGX CRD registered ✓"
 echo ""
 
 ###############################################################################
-# Step 3. MaaS Gateway 생성
-#         AIGateway가 활성화된 후 maas-default-gateway가 필요
+# Step 3. MaaS Gateway
+#         Required after AIGateway is enabled
 ###############################################################################
-info "=== Step 3/6: MaaS Gateway 생성 ==="
+info "=== Step 3/6: MaaS Gateway ==="
 
 CLUSTER_DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')
 
-# Find TLS cert in openshift-ingress
 CERT_NAME=$(oc get secrets -n openshift-ingress --no-headers 2>/dev/null | \
   grep "cert-manager-ingress-cert\|router-certs-default" | awk '{print $1}' | head -1)
 if [ -z "$CERT_NAME" ]; then
-    warn "TLS 인증서를 찾을 수 없음 — cert-manager-ingress-cert 사용"
+    warn "TLS cert not found — using cert-manager-ingress-cert"
     CERT_NAME="cert-manager-ingress-cert"
 fi
 info "Domain: $CLUSTER_DOMAIN, TLS: $CERT_NAME"
@@ -383,7 +370,7 @@ EOF
 
 # Gateway
 if oc get gateway maas-default-gateway -n openshift-ingress &>/dev/null 2>&1; then
-    success "maas-default-gateway 이미 존재 ✓"
+    success "maas-default-gateway already exists ✓"
 else
     oc apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
@@ -413,18 +400,18 @@ spec:
             name: ${CERT_NAME}
         mode: Terminate
 EOF
-    success "maas-default-gateway 생성 완료"
+    success "maas-default-gateway created"
 fi
 echo ""
 
 ###############################################################################
-# Step 4. OdhDashboardConfig 패치 — Dashboard 메뉴 전체 활성화
+# Step 4. OdhDashboardConfig — enable all dashboard menus
 ###############################################################################
-info "=== Step 4/6: Dashboard 메뉴 전체 활성화 ==="
+info "=== Step 4/6: Dashboard menu activation ==="
 
 WAIT=0
 while ! oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications &>/dev/null; do
-    [ $WAIT -ge 60 ] && { error "OdhDashboardConfig 없음"; exit 1; }
+    [ $WAIT -ge 60 ] && { error "OdhDashboardConfig not found"; exit 1; }
     sleep 5; WAIT=$((WAIT + 5))
 done
 
@@ -473,26 +460,26 @@ oc patch odhdashboardconfig odh-dashboard-config \
   }
 }'
 
-success "Dashboard 메뉴 패치 완료"
+success "Dashboard menu patched"
 echo ""
 
 ###############################################################################
-# Step 5. Dashboard 재시작 + 결과 확인
+# Step 5. Restart dashboard
 ###############################################################################
-info "=== Step 5/6: Dashboard 재시작 ==="
+info "=== Step 5/6: Dashboard restart ==="
 oc rollout restart deployment/rhods-dashboard -n redhat-ods-applications 2>/dev/null || true
-info "재시작 중 (1-2분 소요)..."
+info "Restarting (1-2 min)..."
 sleep 10
 oc rollout status deployment/rhods-dashboard -n redhat-ods-applications --timeout=120s 2>/dev/null || \
-    warn "롤아웃 타임아웃 — 잠시 후 자동 완료됩니다"
-success "Dashboard 재시작 완료"
+    warn "Rollout timeout — will complete shortly"
+success "Dashboard restarted"
 echo ""
 
 ###############################################################################
-# Step 6. 결과 확인
+# Step 6. Verification
 ###############################################################################
-info "=== Step 6/6: 결과 확인 ==="
-info "DSC 주요 컴포넌트:"
+info "=== Step 6/6: Verification ==="
+info "DSC components:"
 for comp in MLflowOperatorReady OGXReady AIGatewayReady KserveReady TrustyAIReady AIPipelinesReady DashboardReady WorkbenchesReady ModelsAsAServiceReady; do
     STATUS=$(oc get datasciencecluster default-dsc -o jsonpath="{.status.conditions[?(@.type==\"${comp}\")].status}" 2>/dev/null)
     REASON=$(oc get datasciencecluster default-dsc -o jsonpath="{.status.conditions[?(@.type==\"${comp}\")].reason}" 2>/dev/null)
@@ -523,12 +510,12 @@ done
 
 echo ""
 info "Dashboard URL:"
-echo "  https://$(oc get route data-science-gateway -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo '(확인 필요)')"
+echo "  https://$(oc get route data-science-gateway -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || echo '(check manually)')"
 
 echo ""
 echo "=============================================="
-success "완료! Dashboard를 새로고침하세요."
+success "Done! Refresh the dashboard."
 echo ""
-echo "  ※ MaaS가 NotReady인 경우 DB 설정이 필요합니다:"
-echo "    → scripts/setup-maas.sh 또는 install-rhoai-35.sh --setup-maas 실행"
+echo "  * If MaaS shows NotReady, run the MaaS setup:"
+echo "    bash scripts/sno-setup-maas-35.sh"
 echo "=============================================="

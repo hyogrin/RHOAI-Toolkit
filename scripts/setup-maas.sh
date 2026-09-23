@@ -1050,8 +1050,26 @@ main() {
     echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
     # Choose setup path based on version
-    if is_rhoai_33_or_higher; then
-        echo -e "${GREEN}Using RHOAI 3.3+ integrated MaaS setup${NC}"
+    local major_minor
+    major_minor=$(echo "$RHOAI_MAJOR_VERSION" | awk -F. '{printf "%d%02d", $1, $2}')
+    if [ "$major_minor" -ge 305 ] 2>/dev/null; then
+        echo ""
+        echo -e "${YELLOW}RHOAI 3.5+ detected — MaaS setup has changed significantly.${NC}"
+        echo -e "${YELLOW}DSC uses aigateway.modelsAsAService, requires PostgreSQL DB,${NC}"
+        echo -e "${YELLOW}service-ca TLS, and Redis rate limiting.${NC}"
+        echo ""
+        echo -e "${GREEN}For SNO — MaaS setup (DB + TLS + rate limiting):${NC}"
+        echo "  bash scripts/sno-setup-maas-35.sh"
+        echo ""
+        echo -e "${GREEN}For SNO — enable all features + dashboard menus first:${NC}"
+        echo "  bash scripts/sno-enable-all-features.sh"
+        echo ""
+        echo -e "${GREEN}For a full RHOAI 3.5 installation (includes MaaS):${NC}"
+        echo "  bash scripts/install-rhoai-35.sh"
+        echo ""
+        exit 0
+    elif is_rhoai_33_or_higher; then
+        echo -e "${GREEN}Using RHOAI 3.3/3.4 integrated MaaS setup${NC}"
         echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         setup_maas_33
     else
