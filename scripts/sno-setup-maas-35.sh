@@ -615,16 +615,34 @@ else
     echo "  ⬚  MaaS Tenant (${TENANT_MSG:-not found yet — may take a few minutes})"
 fi
 
-# ModelsAsAServiceReady
+# ModelsAsAServiceReady — poll every 30s until ready (up to 5 min)
 MAAS_STATUS=$(oc get datasciencecluster default-dsc \
     -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].status}' 2>/dev/null || true)
-MAAS_MSG=$(oc get datasciencecluster default-dsc \
-    -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].message}' 2>/dev/null || true)
 if [ "$MAAS_STATUS" = "True" ]; then
     echo "  ✅ ModelsAsAServiceReady"
 else
-    echo "  ⬚  ModelsAsAServiceReady"
-    [ -n "$MAAS_MSG" ] && echo "      $MAAS_MSG"
+    echo "  ⬚  ModelsAsAServiceReady — waiting for reconciliation..."
+    echo ""
+    info "Polling ModelsAsAServiceReady every 30s (up to 5 min)..."
+    WAIT=0
+    while [ $WAIT -lt 300 ]; do
+        sleep 30; WAIT=$((WAIT + 30))
+        MAAS_STATUS=$(oc get datasciencecluster default-dsc \
+            -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].status}' 2>/dev/null || true)
+        if [ "$MAAS_STATUS" = "True" ]; then
+            success "ModelsAsAServiceReady ✓ (after ${WAIT}s)"
+            break
+        fi
+        MAAS_REASON=$(oc get datasciencecluster default-dsc \
+            -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].reason}' 2>/dev/null || true)
+        MAAS_MSG=$(oc get datasciencecluster default-dsc \
+            -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].message}' 2>/dev/null || true)
+        info "[${WAIT}s] ${MAAS_REASON:-NotReady}: ${MAAS_MSG:-(waiting...)}"
+    done
+    if [ "$MAAS_STATUS" != "True" ]; then
+        warn "ModelsAsAServiceReady still not True after 5 min"
+        warn "Check: oc get datasciencecluster default-dsc -o jsonpath='{.status.conditions[?(@.type==\"ModelsAsAServiceReady\")]}'"
+    fi
 fi
 
 CLUSTER_DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')
@@ -638,7 +656,4 @@ echo "  Dashboard:      https://$(oc get gatewayconfig default-gateway -n redhat
 echo ""
 echo "  Deploy a model via Dashboard → Models → llm-d runtime"
 echo "  or use LLMInferenceService CR (see docs)"
-echo ""
-echo "  If ModelsAsAServiceReady shows ⬚, wait 2-3 minutes and check:"
-echo "    oc get datasciencecluster default-dsc -o jsonpath='{.status.conditions[?(@.type==\"ModelsAsAServiceReady\")]}' | python3 -m json.tool"
 echo "=============================================="
