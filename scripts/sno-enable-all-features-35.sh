@@ -5,12 +5,12 @@
 # Enable all RHOAI 3.5 DSC components + dashboard features on an SNO cluster.
 #
 # Execution order is optimized for Web Terminal reliability:
-#   Steps 1-5  — Core configuration (safe, no network disruption)
-#   Step 6     — Operator install (may briefly disrupt Web Terminal)
-#   Step 7     — Verification (best effort)
+#   Steps 1-6  — Core configuration (safe, no network disruption)
+#   Step 7     — Operator install (may briefly disrupt Web Terminal)
+#   Step 8     — Verification (best effort)
 #
-# Steps 1-5 complete before any network disruption caused by RHCL/Service
-# Mesh installation. If the terminal disconnects during Step 6, operators
+# Steps 1-6 complete before any network disruption caused by RHCL/Service
+# Mesh installation. If the terminal disconnects during Step 7, operators
 # continue installing via OLM in the background. Re-run the script to
 # pick up where it left off — all steps are idempotent.
 #
@@ -52,8 +52,8 @@ echo "=============================================="
 echo " RHOAI 3.5 SNO — Enable All Features"
 echo "=============================================="
 echo ""
-info "Order: Config (Steps 1-5) → Operators (Step 6) → Verify (Step 7)"
-info "Steps 1-5 complete before any network disruption."
+info "Order: Config (Steps 1-6) → Operators (Step 7) → Verify (Step 8)"
+info "Steps 1-6 complete before any network disruption."
 echo ""
 
 ###############################################################################
@@ -151,10 +151,10 @@ success "DSC: default-dsc"
 echo ""
 
 ###############################################################################
-# Step 1/7: User Workload Monitoring + DSCI Observability
+# Step 1/8: User Workload Monitoring + DSCI Observability
 #   Required for Observe & Monitor dashboard (Perses / MonitoringStack)
 ###############################################################################
-info "=== Step 1/7: User Workload Monitoring + DSCI Observability ==="
+info "=== Step 1/8: User Workload Monitoring + DSCI Observability ==="
 
 if oc get configmap cluster-monitoring-config -n openshift-monitoring &>/dev/null 2>&1; then
     EXISTING=$(oc get configmap cluster-monitoring-config -n openshift-monitoring \
@@ -244,9 +244,9 @@ done
 echo ""
 
 ###############################################################################
-# Step 2/7: DSC component activation
+# Step 2/8: DSC component activation
 ###############################################################################
-info "=== Step 2/7: DSC component activation ==="
+info "=== Step 2/8: DSC component activation ==="
 
 oc patch datasciencecluster default-dsc --type=merge -p '{
   "spec": {
@@ -283,12 +283,123 @@ oc get crd ogxservers.ogx.io &>/dev/null 2>&1 && success "OGX CRD registered ✓
 echo ""
 
 ###############################################################################
-# Step 3/7: MaaS Gateway
+# Step 3/8: MLflow server + demo project
+#   Creates the demo Data Science Project and a cluster-scoped MLflow CR.
+#   The MLflow operator (enabled in Step 2) creates HTTPRoute + tracking UI.
+###############################################################################
+info "=== Step 3/8: MLflow server + demo project ==="
+
+# Ensure demo namespace exists as a Data Science Project
+if oc get ns demo &>/dev/null 2>&1; then
+    success "Namespace 'demo' exists ✓"
+else
+    info "Creating namespace 'demo'..."
+    oc create namespace demo 2>/dev/null || true
+fi
+# Label as Data Science Project (idempotent)
+oc label namespace demo opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
+success "demo labeled as Data Science Project"
+
+# Wait for MLflow CRD (registered after mlflowoperator becomes Managed)
+info "Waiting for MLflow CRD..."
+WAIT=0
+while ! oc get crd mlflows.mlflow.opendatahub.io &>/dev/null 2>&1; do
+    [ $WAIT -ge 120 ] && { warn "MLflow CRD not ready yet (continuing)"; break; }
+    sleep 5; WAIT=$((WAIT + 5))
+done
+
+if oc get crd mlflows.mlflow.opendatahub.io &>/dev/null 2>&1; then
+    success "MLflow CRD registered ✓"
+
+    # Check if MLflow CR already exists
+    if oc get mlflow mlflow &>/dev/null 2>&1; then
+        success "MLflow server already exists ✓"
+    else
+        # Use PostgreSQL if available, otherwise SQLite with PVC
+        if oc get deployment postgres -n redhat-ods-applications &>/dev/null 2>&1; then
+            info "Using existing PostgreSQL for MLflow backend..."
+
+            # Create mlflow database in PostgreSQL (idempotent)
+            PG_POD=$(oc get pods -n redhat-ods-applications -l app=postgres \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            if [ -n "$PG_POD" ]; then
+                oc exec "$PG_POD" -n redhat-ods-applications -- bash -c \
+                    'PGPASSWORD=$POSTGRESQL_PASSWORD psql -U $POSTGRESQL_USER -d $POSTGRESQL_DATABASE -tc \
+                    "SELECT 1 FROM pg_database WHERE datname='"'"'mlflow'"'"'" | grep -q 1 || \
+                    PGPASSWORD=$POSTGRESQL_PASSWORD psql -U $POSTGRESQL_USER -d $POSTGRESQL_DATABASE -c \
+                    "CREATE DATABASE mlflow;"' 2>/dev/null || warn "Could not create mlflow DB (may already exist)"
+            fi
+
+            # Build PostgreSQL URL for MLflow
+            PG_DEPLOY_NS="redhat-ods-applications"
+            PG_FQDN="postgres.${PG_DEPLOY_NS}.svc.cluster.local"
+            PG_PASSWORD_ACTUAL=$(oc get deployment postgres -n "$PG_DEPLOY_NS" \
+                -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_PASSWORD")].value}' 2>/dev/null)
+            PG_USER=$(oc get deployment postgres -n "$PG_DEPLOY_NS" \
+                -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_USER")].value}' 2>/dev/null)
+            ENCODED_PW=$(printf '%s' "$PG_PASSWORD_ACTUAL" | od -An -tx1 | tr -d ' \n' | sed 's/../%&/g')
+            MLFLOW_DB_URL="postgresql://${PG_USER}:${ENCODED_PW}@${PG_FQDN}:5432/mlflow?sslmode=disable"
+
+            oc create secret generic mlflow-db-credentials \
+                --from-literal=database-url="$MLFLOW_DB_URL" \
+                --dry-run=client -o yaml | oc apply -f - 2>/dev/null
+
+            oc apply -f - <<EOF
+apiVersion: mlflow.opendatahub.io/v1
+kind: MLflow
+metadata:
+  name: mlflow
+spec:
+  replicas: 1
+  backendStoreUriFrom:
+    name: mlflow-db-credentials
+    key: database-url
+  serveArtifacts: true
+  artifactsDestination: "file:///mlflow/artifacts"
+  storage:
+    size: 10Gi
+EOF
+            success "MLflow created (PostgreSQL backend)"
+        else
+            info "No PostgreSQL found — using SQLite with PVC..."
+            oc apply -f - <<'EOF'
+apiVersion: mlflow.opendatahub.io/v1
+kind: MLflow
+metadata:
+  name: mlflow
+spec:
+  serveArtifacts: true
+  artifactsDestination: "file:///mlflow/artifacts"
+  backendStoreUri: "sqlite:////mlflow/mlflow.db"
+  storage:
+    size: 10Gi
+EOF
+            success "MLflow created (SQLite backend)"
+        fi
+
+        # Wait for MLflow to become available
+        info "Waiting for MLflow server..."
+        WAIT=0
+        while [ $WAIT -lt 120 ]; do
+            MLFLOW_READY=$(oc get mlflow mlflow \
+                -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+            [ "$MLFLOW_READY" = "True" ] && { success "MLflow server ready ✓"; break; }
+            sleep 10; WAIT=$((WAIT + 10))
+        done
+        [ "${MLFLOW_READY:-}" != "True" ] && warn "MLflow not ready yet (will reconcile in background)"
+    fi
+else
+    warn "MLflow CRD not available — MLflow will be created on next run"
+fi
+echo ""
+
+###############################################################################
+# Step 4/8: MaaS Gateway
 #   Creates GatewayClass + Gateway CRs. These are just API objects — they
 #   don't require RHCL to be running yet. The gateway controller will
 #   reconcile them once RHCL/Service Mesh is ready.
 ###############################################################################
-info "=== Step 3/7: MaaS Gateway ==="
+info "=== Step 4/8: MaaS Gateway ==="
 
 CLUSTER_DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')
 
@@ -347,9 +458,9 @@ fi
 echo ""
 
 ###############################################################################
-# Step 4/7: Dashboard menu activation
+# Step 5/8: Dashboard menu activation
 ###############################################################################
-info "=== Step 4/7: Dashboard menu activation ==="
+info "=== Step 5/8: Dashboard menu activation ==="
 
 WAIT=0
 while ! oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications &>/dev/null; do
@@ -406,9 +517,9 @@ success "Dashboard menu patched"
 echo ""
 
 ###############################################################################
-# Step 5/7: Dashboard restart
+# Step 6/8: Dashboard restart
 ###############################################################################
-info "=== Step 5/7: Dashboard restart ==="
+info "=== Step 6/8: Dashboard restart ==="
 oc rollout restart deployment/rhods-dashboard -n redhat-ods-applications 2>/dev/null || true
 info "Restarting (1-2 min)..."
 sleep 10
@@ -418,19 +529,19 @@ success "Dashboard restarted"
 echo ""
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-success "Core configuration complete (Steps 1-5)."
-info "Next: operator install (Step 6) may briefly disrupt Web Terminal."
+success "Core configuration complete (Steps 1-6)."
+info "Next: operator install (Step 7) may briefly disrupt Web Terminal."
 info "If disconnected, re-run this script — completed steps are skipped."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
 ###############################################################################
-# Step 6/7: Operator scan & install
+# Step 7/8: Operator scan & install
 #   RHCL installation triggers Service Mesh 3, which may briefly disrupt
 #   the OpenShift ingress layer and Web Terminal connections.
 #   Even if the terminal disconnects, OLM continues the installation.
 ###############################################################################
-info "=== Step 6/7: Operator scan & install ==="
+info "=== Step 7/8: Operator scan & install ==="
 
 declare -a MISSING_NAMES=()
 declare -a MISSING_NS=()
@@ -553,9 +664,9 @@ fi
 echo ""
 
 ###############################################################################
-# Step 7/7: Verification
+# Step 8/8: Verification
 ###############################################################################
-info "=== Step 7/7: Verification ==="
+info "=== Step 8/8: Verification ==="
 info "DSC components:"
 for comp in MLflowOperatorReady OGXReady AIGatewayReady KserveReady TrustyAIReady AIPipelinesReady DashboardReady WorkbenchesReady ModelsAsAServiceReady; do
     STATUS=$(oc get datasciencecluster default-dsc -o jsonpath="{.status.conditions[?(@.type==\"${comp}\")].status}" 2>/dev/null)
