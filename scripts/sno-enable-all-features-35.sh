@@ -661,6 +661,35 @@ EOF
 else
     warn "COO not ready yet — UIPlugins will be configured on next run"
 fi
+
+# RHCL Console Plugin (requires RHCL operator)
+# The kuadrant-console-plugin provides RHCL / Kuadrant UI for managing
+# API policies, rate limiting, and gateway configuration in the console.
+if oc get consoleplugin kuadrant-console-plugin &>/dev/null 2>&1; then
+    # ConsolePlugin CR exists — check if the backing pod is running
+    if oc get pods -n redhat-connectivity-link-operator --no-headers 2>/dev/null \
+        | grep -q "kuadrant-console-plugin.*Running"; then
+
+        # Check if already enabled in console operator
+        ENABLED_PLUGINS=$(oc get console.operator.openshift.io cluster \
+            -o jsonpath='{.spec.plugins}' 2>/dev/null || echo "[]")
+        if echo "$ENABLED_PLUGINS" | grep -q "kuadrant-console-plugin"; then
+            success "RHCL console plugin already enabled ✓"
+        else
+            info "Enabling RHCL console plugin..."
+            if oc patch console.operator.openshift.io cluster --type=json \
+                -p '[{"op":"add","path":"/spec/plugins/-","value":"kuadrant-console-plugin"}]' 2>/dev/null; then
+                success "RHCL console plugin enabled"
+            else
+                warn "Could not enable RHCL console plugin — enable manually via Console → Operators → Installed Operators → RHCL"
+            fi
+        fi
+    else
+        warn "kuadrant-console-plugin pod not running yet — plugin will be enabled on next run"
+    fi
+else
+    warn "RHCL console plugin CR not found — RHCL operator may still be installing"
+fi
 echo ""
 
 ###############################################################################
@@ -696,6 +725,18 @@ PERSES_STATUS=$(oc get dscinitialization default-dsci \
   -o jsonpath='{.status.conditions[?(@.type=="PersesAvailable")].status}' 2>/dev/null)
 [ "${MON_STATUS:-}" = "True" ] && echo "  ✅ MonitoringStack" || echo "  ⬚  MonitoringStack"
 [ "${PERSES_STATUS:-}" = "True" ] && echo "  ✅ Perses" || echo "  ⬚  Perses"
+
+echo ""
+info "Console Plugins:"
+for PLUGIN_NAME in kuadrant-console-plugin console-dashboards-plugin monitoring-console-plugin; do
+    ENABLED_PLUGINS=$(oc get console.operator.openshift.io cluster \
+        -o jsonpath='{.spec.plugins}' 2>/dev/null || echo "[]")
+    if echo "$ENABLED_PLUGINS" | grep -q "$PLUGIN_NAME"; then
+        echo "  ✅ ${PLUGIN_NAME}"
+    else
+        echo "  ⬚  ${PLUGIN_NAME}"
+    fi
+done
 
 echo ""
 info "Gateway:"
