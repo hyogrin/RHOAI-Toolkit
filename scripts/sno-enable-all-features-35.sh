@@ -636,6 +636,103 @@ else
     warn "LWS CRD not ready yet — LeaderWorkerSetOperator CR will be created on next run"
 fi
 
+# Kueue Resource Queues (requires Kueue operator)
+# Creates ResourceFlavors, ClusterQueue, and LocalQueue to enable hardware
+# profile selection and workload scheduling for workbenches / model serving.
+# Without these, the dashboard shows "No enabled or valid hardware profiles".
+if oc get crd clusterqueues.kueue.x-k8s.io &>/dev/null 2>&1; then
+    info "Configuring Kueue resource queues..."
+
+    # ResourceFlavor: default (CPU workloads — schedules on any untainted node)
+    if oc get resourceflavor default-flavor &>/dev/null 2>&1; then
+        success "ResourceFlavor default-flavor ✓"
+    else
+        oc apply -f - <<'EOF'
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: default-flavor
+spec: {}
+EOF
+        success "ResourceFlavor default-flavor created"
+    fi
+
+    # ResourceFlavor: gpu (GPU workloads — nodes with nvidia.com/gpu, tolerates taint)
+    if oc get resourceflavor gpu-flavor &>/dev/null 2>&1; then
+        success "ResourceFlavor gpu-flavor ✓"
+    else
+        oc apply -f - <<'EOF'
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: gpu-flavor
+spec:
+  nodeLabels:
+    nvidia.com/gpu.present: "true"
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+EOF
+        success "ResourceFlavor gpu-flavor created"
+    fi
+
+    # ClusterQueue: default (quotas for CPU + GPU workloads)
+    if oc get clusterqueue default &>/dev/null 2>&1; then
+        success "ClusterQueue default ✓"
+    else
+        oc apply -f - <<'EOF'
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: default
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: cpu
+              nominalQuota: 32
+            - name: memory
+              nominalQuota: 128Gi
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: gpu-flavor
+          resources:
+            - name: nvidia.com/gpu
+              nominalQuota: 4
+EOF
+        success "ClusterQueue default created"
+    fi
+
+    # LocalQueue in demo namespace (namespace created in Step 3)
+    # The default-queue annotation makes it auto-selected for new workloads.
+    if oc get ns demo &>/dev/null 2>&1; then
+        if oc get localqueue default -n demo &>/dev/null 2>&1; then
+            success "LocalQueue default in demo ✓"
+        else
+            oc apply -f - <<'EOF'
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: default
+  namespace: demo
+  annotations:
+    kueue.x-k8s.io/default-queue: "true"
+spec:
+  clusterQueue: default
+EOF
+            success "LocalQueue default created in demo"
+        fi
+    else
+        warn "demo namespace not found — create it first, then re-run to add LocalQueue"
+    fi
+else
+    warn "Kueue CRDs not ready yet — resource queues will be configured on next run"
+fi
+
 # UIPlugins (requires COO)
 if oc get crd uiplugins.observability.openshift.io &>/dev/null 2>&1; then
     info "Configuring UIPlugins..."
@@ -725,6 +822,19 @@ PERSES_STATUS=$(oc get dscinitialization default-dsci \
   -o jsonpath='{.status.conditions[?(@.type=="PersesAvailable")].status}' 2>/dev/null)
 [ "${MON_STATUS:-}" = "True" ] && echo "  ✅ MonitoringStack" || echo "  ⬚  MonitoringStack"
 [ "${PERSES_STATUS:-}" = "True" ] && echo "  ✅ Perses" || echo "  ⬚  Perses"
+
+echo ""
+info "Kueue:"
+CQ_ACTIVE=$(oc get clusterqueue default \
+    -o jsonpath='{.status.conditions[?(@.type=="Active")].status}' 2>/dev/null || true)
+[ "$CQ_ACTIVE" = "True" ] && echo "  ✅ ClusterQueue default (Active)" || echo "  ⬚  ClusterQueue default"
+RF_COUNT=$(oc get resourceflavor --no-headers 2>/dev/null | wc -l | tr -d ' ')
+echo "  ✅ ResourceFlavors: $RF_COUNT"
+for NS in demo; do
+    LQ_ACTIVE=$(oc get localqueue default -n "$NS" \
+        -o jsonpath='{.status.conditions[?(@.type=="Active")].status}' 2>/dev/null || true)
+    [ "$LQ_ACTIVE" = "True" ] && echo "  ✅ LocalQueue default in $NS (Active)" || echo "  ⬚  LocalQueue default in $NS"
+done
 
 echo ""
 info "Console Plugins:"
