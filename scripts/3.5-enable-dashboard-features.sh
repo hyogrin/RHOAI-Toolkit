@@ -269,11 +269,19 @@ verify_dashboard_features() {
     echo ""
 }
 
+# Helper: extract value from flat JSON (no python3/jq needed)
+_json_val() {
+    local json="$1" key="$2"
+    # Matches "key": value  or  "key":value  (bool/string/number)
+    echo "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' | tr -d ' "' | head -1
+}
+
 # Helper: check a boolean flag (true = enabled)
 _check_flag() {
     local config="$1" key="$2" label="$3"
     local val
-    val=$(echo "$config" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$key','<unset>'))" 2>/dev/null || echo "<unset>")
+    val=$(_json_val "$config" "$key")
+    [ -z "$val" ] && val="<unset>"
     if [ "$val" = "true" ] || [ "$val" = "True" ]; then
         printf "  │  ✅ %-40s %s\n" "$label" ""
     else
@@ -285,7 +293,8 @@ _check_flag() {
 _check_disable_flag() {
     local config="$1" key="$2" label="$3"
     local val
-    val=$(echo "$config" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$key','<unset>'))" 2>/dev/null || echo "<unset>")
+    val=$(_json_val "$config" "$key")
+    [ -z "$val" ] && val="<unset>"
     if [ "$val" = "false" ] || [ "$val" = "False" ]; then
         printf "  │  ✅ %-40s %s\n" "$label" ""
     else
@@ -380,7 +389,8 @@ main() {
 
     # Show dashboard URL
     local dashboard_url
-    dashboard_url=$(oc get route rh-ai -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || \
+    dashboard_url=$(oc get route data-science-gateway -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || \
+                    oc get route rh-ai -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || \
                     oc get route rhods-dashboard -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || \
                     echo "")
     if [ -n "$dashboard_url" ]; then

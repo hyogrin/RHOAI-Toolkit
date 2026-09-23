@@ -45,7 +45,8 @@ declare -a OP_NAMES=( "Kueue"              "cert-manager"                    "LW
 declare -a OP_NS=(    "openshift-operators" "cert-manager-operator"           "openshift-lws-operator"      "openshift-opentelemetry-operator" "openshift-tempo-operator" "openshift-cluster-observability-operator"          "redhat-connectivity-link-operator" )
 declare -a OP_GREP=(  "kueue"              "cert-manager"                    "leader-worker-set"           "opentelemetry"                    "tempo"                    "cluster-observability-operator"                    "rhcl-operator" )
 declare -a OP_SUB=(   "kueue-operator"     "openshift-cert-manager-operator" "leader-worker-set"           "opentelemetry-product"            "tempo-product"            "cluster-observability-operator"                    "rhcl-operator" )
-declare -a OP_CH=(    "stable-v1.3"        "stable-v1"                       "stable-v1.0"                 "stable"                           "stable"                   "stable"                                            "stable-v1" )
+declare -a OP_CH=(    "stable-v1.3"        "stable-v1"                       "stable-v1.0"                 "stable"                           "stable"                   "stable"                                            "auto" )
+declare -a OP_MODE=(  "skip"               "own"                             "own"                         "own"                              "own"                      "own"                                               "all" )
 declare -a OP_USE=(   "Workbenches / DW"   "KServe / Model Serving"          "llm-d distributed inference" "Metrics & trace collection"       "Distributed trace store"  "Observe & Monitor dashboard (Perses)"              "MaaS / AIGateway" )
 
 echo "=============================================="
@@ -64,11 +65,19 @@ install_operator() {
     local NAMESPACE="$2"
     local SUB_NAME="$3"
     local CHANNEL="${4:-stable}"
+    local MODE="${5:-own}"       # skip | own | all
 
-    info "Installing ${DISPLAY_NAME}..."
+    # Auto-detect channel from packagemanifest when set to "auto"
+    if [ "$CHANNEL" = "auto" ]; then
+        CHANNEL=$(oc get packagemanifest "$SUB_NAME" -o jsonpath='{.status.defaultChannel}' 2>/dev/null)
+        [ -z "$CHANNEL" ] && CHANNEL="stable"
+        info "Auto-detected channel: ${CHANNEL} for ${SUB_NAME}"
+    fi
 
-    if [ "$NAMESPACE" = "openshift-operators" ]; then
-        # openshift-operators already has Namespace + OperatorGroup
+    info "Installing ${DISPLAY_NAME} (ns=${NAMESPACE}, ch=${CHANNEL}, mode=${MODE})..."
+
+    if [ "$MODE" = "skip" ]; then
+        # openshift-operators: already has Namespace + OperatorGroup
         oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
@@ -82,7 +91,36 @@ spec:
   source: redhat-operators
   sourceNamespace: openshift-marketplace
 EOF
+    elif [ "$MODE" = "all" ]; then
+        # AllNamespaces mode: OperatorGroup WITHOUT targetNamespaces (e.g. RHCL)
+        oc apply -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: ${SUB_NAME}-group
+  namespace: ${NAMESPACE}
+spec:
+  upgradeStrategy: Default
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ${SUB_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  channel: ${CHANNEL}
+  installPlanApproval: Automatic
+  name: ${SUB_NAME}
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
     else
+        # OwnNamespace mode: OperatorGroup WITH targetNamespaces (e.g. LWS, cert-manager)
         oc apply -f - <<EOF
 apiVersion: v1
 kind: Namespace
@@ -781,7 +819,7 @@ if [ ${#MISSING_NAMES[@]} -gt 0 ]; then
         echo ""
         for j in "${!MISSING_IDX[@]}"; do
             idx=${MISSING_IDX[$j]}
-            install_operator "${OP_NAMES[$idx]}" "${OP_NS[$idx]}" "${OP_SUB[$idx]}" "${OP_CH[$idx]}"
+            install_operator "${OP_NAMES[$idx]}" "${OP_NS[$idx]}" "${OP_SUB[$idx]}" "${OP_CH[$idx]}" "${OP_MODE[$idx]}"
         done
         echo ""
 
