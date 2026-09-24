@@ -528,6 +528,24 @@ EOF
         [ "${EVALHUB_PHASE:-}" != "Ready" ] && warn "EvalHub not ready yet (will reconcile in background)"
     fi
 
+    # Ensure MLFLOW_TRACKING_URI is set in EvalHub CR spec.env
+    # (eval job pods inherit env from the CR; without this, MLflow logging fails server-side)
+    MLFLOW_URI="https://mlflow.${EVALHUB_NS}.svc:8443/mlflow"
+    CURRENT_URI=$(oc get evalhub evalhub -n "$EVALHUB_NS" \
+        -o jsonpath='{.spec.env[?(@.name=="MLFLOW_TRACKING_URI")].value}' 2>/dev/null || true)
+    if [ "$CURRENT_URI" = "$MLFLOW_URI" ]; then
+        success "EvalHub MLFLOW_TRACKING_URI already set ✓"
+    else
+        info "Patching EvalHub with MLFLOW_TRACKING_URI..."
+        oc patch evalhub evalhub -n "$EVALHUB_NS" --type=merge -p "
+spec:
+  env:
+  - name: MLFLOW_TRACKING_URI
+    value: ${MLFLOW_URI}
+"
+        success "EvalHub MLFLOW_TRACKING_URI set to ${MLFLOW_URI}"
+    fi
+
     # RBAC: grant EvalHub access to demo project
     info "Configuring EvalHub RBAC for demo namespace..."
     oc apply -f - <<EOF
