@@ -646,10 +646,13 @@ EOF
     # this volume for TLS trust back to the EvalHub API)
     if ! oc get configmap evalhub-service-ca -n demo &>/dev/null 2>&1; then
         if oc get configmap evalhub-service-ca -n "$EVALHUB_NS" &>/dev/null 2>&1; then
-            oc get configmap evalhub-service-ca -n "$EVALHUB_NS" -o yaml \
-                | sed 's/namespace: '"$EVALHUB_NS"'/namespace: demo/' \
-                | grep -v '^\s*resourceVersion:\|^\s*uid:\|^\s*creationTimestamp:' \
-                | oc apply -f -
+            CA_BUNDLE=$(oc get configmap evalhub-service-ca -n "$EVALHUB_NS" \
+                -o jsonpath='{.data.service-ca\.crt}' 2>/dev/null)
+            if [ -n "$CA_BUNDLE" ]; then
+                oc create configmap evalhub-service-ca -n demo \
+                    --from-literal="service-ca.crt=$CA_BUNDLE" \
+                    --dry-run=client -o yaml | oc apply -f -
+            fi
             success "evalhub-service-ca ConfigMap copied to demo"
         else
             warn "evalhub-service-ca ConfigMap not found in $EVALHUB_NS — eval jobs may fail to mount TLS volume"
