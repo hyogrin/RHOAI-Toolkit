@@ -5,12 +5,14 @@
 # Enable all RHOAI 3.5 DSC components + dashboard features on an SNO cluster.
 #
 # Execution order is optimized for Web Terminal reliability:
-#   Steps 1-6  — Core configuration (safe, no network disruption)
-#   Step 7     — Operator install (may briefly disrupt Web Terminal)
-#   Step 8     — Verification (best effort)
+#   Steps 1-5  — Core configuration (safe, no network disruption)
+#   Step 6     — Operator install (may briefly disrupt Web Terminal)
+#   Step 7     — Post-operator setup (DSCI monitoring, UIPlugins, CRs)
+#   Step 8     — Dashboard restart (picks up everything)
+#   Step 9     — Verification (best effort)
 #
-# Steps 1-6 complete before any network disruption caused by RHCL/Service
-# Mesh installation. If the terminal disconnects during Step 7, operators
+# Steps 1-5 complete before any network disruption caused by RHCL/Service
+# Mesh installation. If the terminal disconnects during Step 6, operators
 # continue installing via OLM in the background. Re-run the script to
 # pick up where it left off — all steps are idempotent.
 #
@@ -53,8 +55,8 @@ echo "=============================================="
 echo " RHOAI 3.5 SNO — Enable All Features"
 echo "=============================================="
 echo ""
-info "Order: Config (Steps 1-6) → Operators (Step 7) → Verify (Step 8)"
-info "Steps 1-6 complete before any network disruption."
+info "Order: Config (1-5) → Operators (6) → Post-op (7) → Restart (8) → Verify (9)"
+info "Steps 1-5 complete before any network disruption."
 echo ""
 
 ###############################################################################
@@ -191,10 +193,11 @@ success "DSC: default-dsc"
 echo ""
 
 ###############################################################################
-# Step 1/8: User Workload Monitoring + DSCI Observability
-#   Required for Observe & Monitor dashboard (Perses / MonitoringStack)
+# Step 1/9: User Workload Monitoring
+#   Prerequisite for Observe & Monitor.  DSCI monitoring (metrics/traces)
+#   is configured later in Step 7 after COO + Tempo are installed.
 ###############################################################################
-info "=== Step 1/8: User Workload Monitoring + DSCI Observability ==="
+info "=== Step 1/9: User Workload Monitoring ==="
 
 if oc get configmap cluster-monitoring-config -n openshift-monitoring &>/dev/null 2>&1; then
     EXISTING=$(oc get configmap cluster-monitoring-config -n openshift-monitoring \
@@ -235,58 +238,12 @@ while [ "$(oc get pods -n openshift-user-workload-monitoring --no-headers 2>/dev
     [ $WAIT -ge 60 ] && { warn "Monitoring pods wait timeout (continuing)"; break; }
     sleep 5; WAIT=$((WAIT + 5))
 done
-
-# DSCI monitoring metrics/traces config
-# Without metrics.storage, Perses/MonitoringStack will not start
-info "Configuring DSCI observability..."
-METRICS_CONFIGURED=$(oc get dscinitialization default-dsci \
-  -o jsonpath='{.spec.monitoring.metrics.storage.size}' 2>/dev/null)
-if [ -n "$METRICS_CONFIGURED" ]; then
-    success "DSCI metrics already configured (storage: $METRICS_CONFIGURED) ✓"
-else
-    oc patch dscinitialization default-dsci --type=merge -p '{
-      "spec": {
-        "monitoring": {
-          "managementState": "Managed",
-          "namespace": "redhat-ods-monitoring",
-          "alerting": {},
-          "metrics": {
-            "replicas": 1,
-            "storage": {
-              "size": "5Gi",
-              "retention": "90d"
-            }
-          },
-          "traces": {
-            "sampleRatio": "0.1",
-            "storage": {
-              "backend": "pv",
-              "retention": "2160h"
-            }
-          }
-        }
-      }
-    }'
-    success "DSCI metrics/traces configured"
-fi
-
-# Wait for MonitoringStack (best effort — may not be ready without COO)
-info "Waiting for MonitoringStack..."
-MON_STATUS=""
-WAIT=0
-while [ $WAIT -lt 120 ]; do
-    MON_STATUS=$(oc get dscinitialization default-dsci \
-      -o jsonpath='{.status.conditions[?(@.type=="MonitoringStackAvailable")].status}' 2>/dev/null)
-    [ "$MON_STATUS" = "True" ] && { success "MonitoringStack ✓"; break; }
-    sleep 10; WAIT=$((WAIT + 10))
-done
-[ "${MON_STATUS:-}" != "True" ] && warn "MonitoringStack not ready yet (will reconcile in background)"
 echo ""
 
 ###############################################################################
-# Step 2/8: DSC component activation
+# Step 2/9: DSC component activation
 ###############################################################################
-info "=== Step 2/8: DSC component activation ==="
+info "=== Step 2/9: DSC component activation ==="
 
 oc patch datasciencecluster default-dsc --type=merge -p '{
   "spec": {
@@ -337,7 +294,7 @@ echo ""
 #   Note: Uses the existing 'maas' database for MLflow (the maas user does
 #   not have CREATEDB privilege). MLflow creates its own tables within it.
 ###############################################################################
-info "=== Step 3/8: MLflow server + demo project ==="
+info "=== Step 3/9: MLflow server + demo project ==="
 
 MLFLOW_NS="redhat-ods-applications"
 
@@ -634,7 +591,7 @@ echo ""
 #   don't require RHCL to be running yet. The gateway controller will
 #   reconcile them once RHCL/Service Mesh is ready.
 ###############################################################################
-info "=== Step 4/8: MaaS Gateway ==="
+info "=== Step 4/9: MaaS Gateway ==="
 
 CLUSTER_DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')
 
@@ -695,7 +652,7 @@ echo ""
 ###############################################################################
 # Step 5/8: Dashboard menu activation
 ###############################################################################
-info "=== Step 5/8: Dashboard menu activation ==="
+info "=== Step 5/9: Dashboard menu activation ==="
 
 WAIT=0
 while ! oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications &>/dev/null; do
@@ -751,32 +708,20 @@ oc patch odhdashboardconfig odh-dashboard-config \
 success "Dashboard menu patched"
 echo ""
 
-###############################################################################
-# Step 6/8: Dashboard restart
-###############################################################################
-info "=== Step 6/8: Dashboard restart ==="
-oc rollout restart deployment/rhods-dashboard -n redhat-ods-applications 2>/dev/null || true
-info "Restarting (1-2 min)..."
-sleep 10
-oc rollout status deployment/rhods-dashboard -n redhat-ods-applications --timeout=120s 2>/dev/null || \
-    warn "Rollout timeout — will complete shortly"
-success "Dashboard restarted"
-echo ""
-
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-success "Core configuration complete (Steps 1-6)."
-info "Next: operator install (Step 7) may briefly disrupt Web Terminal."
+success "Core configuration complete (Steps 1-5)."
+info "Next: operator install (Step 6) may briefly disrupt Web Terminal."
 info "If disconnected, re-run this script — completed steps are skipped."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
 ###############################################################################
-# Step 7/8: Operator scan & install
+# Step 6/9: Operator scan & install
 #   RHCL installation triggers Service Mesh 3, which may briefly disrupt
 #   the OpenShift ingress layer and Web Terminal connections.
 #   Even if the terminal disconnects, OLM continues the installation.
 ###############################################################################
-info "=== Step 7/8: Operator scan & install ==="
+info "=== Step 6/9: Operator scan & install ==="
 
 declare -a MISSING_NAMES=()
 declare -a MISSING_NS=()
@@ -1048,9 +993,143 @@ fi
 echo ""
 
 ###############################################################################
-# Step 8/8: Verification
+# Step 7/9: DSCI Observability + Post-operator setup
+#   COO + Tempo must be installed BEFORE configuring DSCI metrics/traces.
+#   Otherwise DSCI reconciler sets Ready=Error and MonitoringStack/Perses
+#   are never created.  This step (re-)triggers DSCI reconciliation.
 ###############################################################################
-info "=== Step 8/8: Verification ==="
+info "=== Step 7/9: DSCI Observability + Post-operator setup ==="
+
+# Check whether COO and Tempo are available
+COO_OK=false; TEMPO_OK=false
+oc get csv -n openshift-cluster-observability-operator --no-headers 2>/dev/null \
+    | grep -q "cluster-observability-operator.*Succeeded" && COO_OK=true
+oc get csv -n openshift-tempo-operator --no-headers 2>/dev/null \
+    | grep -q "tempo.*Succeeded" && TEMPO_OK=true
+
+if $COO_OK; then
+    success "COO installed ✓"
+else
+    warn "COO not installed — Observe & Monitor will not work"
+fi
+if $TEMPO_OK; then
+    success "Tempo installed ✓"
+else
+    warn "Tempo not installed — traces will not work"
+fi
+
+if $COO_OK; then
+    # --- DSCI monitoring: metrics + traces ---
+    # This MUST run after COO is installed. If run before, DSCI sets
+    # Ready=Error("ClusterObservability operator must be installed")
+    # and MonitoringStack/Perses are never provisioned.
+    info "Configuring DSCI observability (metrics + traces)..."
+
+    # Check current DSCI error state
+    DSCI_READY=$(oc get dscinitialization default-dsci \
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+    DSCI_REASON=$(oc get dscinitialization default-dsci \
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null)
+
+    NEED_RETRIGGER=false
+    if [ "$DSCI_READY" = "False" ] && [ "$DSCI_REASON" = "Error" ]; then
+        warn "DSCI stuck in Error state — will re-trigger reconciliation"
+        NEED_RETRIGGER=true
+    fi
+
+    METRICS_CONFIGURED=$(oc get dscinitialization default-dsci \
+        -o jsonpath='{.spec.monitoring.metrics.storage.size}' 2>/dev/null)
+    if [ -n "$METRICS_CONFIGURED" ] && [ "$NEED_RETRIGGER" = false ]; then
+        success "DSCI metrics already configured (storage: $METRICS_CONFIGURED) ✓"
+    else
+        # Apply or re-apply monitoring config
+        oc patch dscinitialization default-dsci --type=merge -p '{
+          "spec": {
+            "monitoring": {
+              "managementState": "Managed",
+              "namespace": "redhat-ods-monitoring",
+              "alerting": {},
+              "metrics": {
+                "replicas": 1,
+                "storage": {
+                  "size": "5Gi",
+                  "retention": "90d"
+                }
+              },
+              "traces": {
+                "sampleRatio": "0.1",
+                "storage": {
+                  "backend": "pv",
+                  "retention": "2160h"
+                }
+              }
+            }
+          }
+        }'
+        success "DSCI metrics/traces configured"
+
+        if [ "$NEED_RETRIGGER" = true ]; then
+            # Force DSCI re-reconciliation by toggling an annotation
+            info "Re-triggering DSCI reconciliation..."
+            oc annotate dscinitialization default-dsci \
+                "opendatahub.io/retrigger=$(date +%s)" --overwrite 2>/dev/null || true
+        fi
+    fi
+
+    # Wait for MonitoringStack
+    info "Waiting for MonitoringStack (up to 3 min)..."
+    MON_STATUS=""
+    WAIT=0
+    while [ $WAIT -lt 180 ]; do
+        MON_STATUS=$(oc get dscinitialization default-dsci \
+            -o jsonpath='{.status.conditions[?(@.type=="MonitoringStackAvailable")].status}' 2>/dev/null)
+        [ "$MON_STATUS" = "True" ] && { success "MonitoringStack ✓"; break; }
+        # Check if DSCI still errored (operator might need restart)
+        if [ $WAIT -eq 60 ]; then
+            DSCI_READY2=$(oc get dscinitialization default-dsci \
+                -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+            if [ "$DSCI_READY2" = "False" ]; then
+                warn "DSCI still not Ready after 60s — restarting RHOAI operator to re-trigger..."
+                oc delete pod -n redhat-ods-operator -l name=rhods-operator --force --grace-period=0 2>/dev/null || true
+            fi
+        fi
+        sleep 10; WAIT=$((WAIT + 10))
+    done
+    [ "${MON_STATUS:-}" != "True" ] && warn "MonitoringStack not ready yet (will reconcile in background)"
+
+    # Wait for Perses
+    info "Waiting for Perses..."
+    PERSES_STATUS=""
+    WAIT=0
+    while [ $WAIT -lt 120 ]; do
+        PERSES_STATUS=$(oc get dscinitialization default-dsci \
+            -o jsonpath='{.status.conditions[?(@.type=="PersesAvailable")].status}' 2>/dev/null)
+        [ "$PERSES_STATUS" = "True" ] && { success "Perses ✓"; break; }
+        sleep 10; WAIT=$((WAIT + 10))
+    done
+    [ "${PERSES_STATUS:-}" != "True" ] && warn "Perses not ready yet (will reconcile in background)"
+fi
+echo ""
+
+###############################################################################
+# Step 8/9: Dashboard restart
+#   Restart AFTER all config + operators + post-operator resources are in
+#   place. This ensures the dashboard picks up UIPlugins, Perses, and all
+#   dashboard feature flags in a single restart.
+###############################################################################
+info "=== Step 8/9: Dashboard restart ==="
+oc rollout restart deployment/rhods-dashboard -n redhat-ods-applications 2>/dev/null || true
+info "Restarting (1-2 min)..."
+sleep 10
+oc rollout status deployment/rhods-dashboard -n redhat-ods-applications --timeout=120s 2>/dev/null || \
+    warn "Rollout timeout — will complete shortly"
+success "Dashboard restarted"
+echo ""
+
+###############################################################################
+# Step 9/9: Verification
+###############################################################################
+info "=== Step 9/9: Verification ==="
 info "DSC components:"
 for comp in MLflowOperatorReady OGXReady AIGatewayReady KserveReady TrustyAIReady AIPipelinesReady DashboardReady WorkbenchesReady ModelsAsAServiceReady; do
     STATUS=$(oc get datasciencecluster default-dsc -o jsonpath="{.status.conditions[?(@.type==\"${comp}\")].status}" 2>/dev/null)
@@ -1138,9 +1217,13 @@ echo ""
 echo "=============================================="
 success "Done! Refresh the dashboard."
 echo ""
-echo "  * If MaaS shows NotReady, run the MaaS setup:"
-echo "    bash scripts/sno-setup-maas-35.sh"
+echo "  Next steps:"
+echo "  • Deploy a model: Dashboard → Model Serving → Deploy"
+echo "    - vLLM: InferenceService (direct endpoint, MaaS 미지원)"
+echo "    - llm-d: LLMInferenceService (MaaS gateway 경유)"
 echo ""
-echo "  * If some operators show ⬚, re-run this script."
+echo "  • MaaS (llm-d only): bash scripts/sno-setup-maas-35.sh"
+echo ""
+echo "  • If some operators show ⬚, re-run this script."
 echo "    Operators installed by OLM continue in the background."
 echo "=============================================="
