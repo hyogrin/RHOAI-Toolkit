@@ -17,7 +17,7 @@
 #   - Current user is added to rhods-admins group for subscription auth
 #
 # Workflow after this script:
-#   1. Deploy a model via Dashboard (vLLM runtime → InferenceService)
+#   1. Deploy a model via Dashboard → Gen AI Studio → Deploy (llm-d runtime)
 #   2. Register Subscription + Auth Policy via Dashboard
 #   3. Verify with:  curl /v1/models  (via MaaS endpoint)
 #
@@ -771,7 +771,7 @@ echo "  Dashboard:      https://${DASHBOARD_URL}"
 echo ""
 echo "  Next steps:"
 echo "  ────────────────────────────────────────────"
-echo "  1. Deploy model:  Dashboard → Gen AI Studio → Deploy (vLLM runtime)"
+echo "  1. Deploy model:  Dashboard → Gen AI Studio → Deploy (llm-d runtime)"
 echo "  2. Register subscription + auth policy via Dashboard"
 echo "  3. Verify:"
 echo "     TOKEN=\$(oc whoami -t)"
