@@ -1038,6 +1038,26 @@ if oc get crd kuadrants.kuadrant.io &>/dev/null 2>&1; then
         oc delete kuadrant kuadrant -n redhat-connectivity-link-operator --wait=false 2>/dev/null || true
         sleep 5
     fi
+
+    # Wait for RHCL sub-operators before creating Kuadrant CR
+    # Without this, Kuadrant gets stuck on MissingDependency (race condition)
+    if ! oc get kuadrant kuadrant -n "$KUADRANT_NS" &>/dev/null 2>&1; then
+        info "Waiting for RHCL sub-operators (Authorino, Limitador)..."
+        WAIT=0
+        while [ $WAIT -lt 120 ]; do
+            ALL_READY=true
+            for SUB_OP in authorino-operator limitador-operator; do
+                CSV_PHASE=$(oc get csv -n redhat-connectivity-link-operator --no-headers 2>/dev/null \
+                    | grep "$SUB_OP" | awk '{print $NF}')
+                [ "$CSV_PHASE" = "Succeeded" ] || { ALL_READY=false; break; }
+            done
+            [ "$ALL_READY" = true ] && break
+            sleep 10; WAIT=$((WAIT + 10))
+        done
+        [ "$ALL_READY" = true ] && success "Sub-operators ready ✓" || \
+            warn "Sub-operators not all ready — proceeding"
+    fi
+
     if oc get kuadrant kuadrant -n "$KUADRANT_NS" &>/dev/null 2>&1; then
         success "Kuadrant CR already exists in $KUADRANT_NS ✓"
     else
@@ -1051,41 +1071,62 @@ metadata:
   namespace: ${KUADRANT_NS}
 spec: {}
 EOF
-        info "Waiting for Kuadrant to become Ready..."
-        WAIT=0
-        while [ $WAIT -lt 60 ]; do
-            KREADY=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
-                -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-            [ "$KREADY" = "True" ] && break
-            sleep 5; WAIT=$((WAIT + 5))
-        done
-        success "Kuadrant CR created in $KUADRANT_NS (activates RHCL features)"
     fi
 
+    # Wait for Kuadrant Ready; full recovery if stuck on MissingDependency
+    # NOTE: Kuadrant operator checks dependencies at startup and caches result.
+    # OLM reverts rollout restart, so recovery = delete CR → kill pod → recreate CR.
+    info "Waiting for Kuadrant to become Ready..."
+    WAIT=0
+    while [ $WAIT -lt 90 ]; do
+        KREADY=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+        [ "$KREADY" = "True" ] && break
+        if [ $WAIT -eq 30 ] && [ "$KREADY" != "True" ]; then
+            KREASON=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
+                -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)
+            if [ "$KREASON" = "MissingDependency" ]; then
+                warn "MissingDependency — full recovery (delete CR → kill pod → recreate)..."
+                oc delete kuadrant kuadrant -n "$KUADRANT_NS" --timeout=30s 2>/dev/null || true
+                sleep 5
+                KPOD=$(oc get pod -n redhat-connectivity-link-operator --no-headers 2>/dev/null \
+                    | grep kuadrant-operator-controller-manager | awk '{print $1}')
+                [ -n "$KPOD" ] && oc delete pod "$KPOD" -n redhat-connectivity-link-operator 2>/dev/null || true
+                sleep 20
+                oc apply -f - <<EOFRECOVERY
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: ${KUADRANT_NS}
+spec: {}
+EOFRECOVERY
+            fi
+        fi
+        sleep 5; WAIT=$((WAIT + 5))
+    done
+    [ "$KREADY" = "True" ] && success "Kuadrant CR Ready in $KUADRANT_NS ✓" || \
+        warn "Kuadrant not Ready yet — MaaS setup script will handle it"
+
     # Configure Authorino TLS in kuadrant-system (required for MaaS gateway auth)
-    # The Kuadrant CR auto-creates Authorino; we add TLS using OpenShift service-ca.
     AUTHORINO_TLS=$(oc get authorino authorino -n "$KUADRANT_NS" \
         -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
     if [ "$AUTHORINO_TLS" = "true" ]; then
         success "Authorino TLS already enabled in $KUADRANT_NS ✓"
     elif oc get authorino authorino -n "$KUADRANT_NS" &>/dev/null 2>&1; then
         info "Configuring Authorino TLS in $KUADRANT_NS..."
-        # Annotate service for service-ca cert generation
         oc annotate service authorino-authorino-authorization \
             -n "$KUADRANT_NS" \
             service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
             --overwrite 2>/dev/null || true
-        # Wait for cert
         WAIT=0
         while [ $WAIT -lt 30 ]; do
             oc get secret authorino-server-cert -n "$KUADRANT_NS" &>/dev/null 2>&1 && break
             sleep 3; WAIT=$((WAIT + 3))
         done
-        # Enable TLS on Authorino
         oc patch authorino authorino -n "$KUADRANT_NS" --type=merge -p '{
           "spec": { "listener": { "tls": { "enabled": true, "certSecretRef": { "name": "authorino-server-cert" } } } }
         }' 2>/dev/null || true
-        # SSL env vars for Authorino deployment
         oc -n "$KUADRANT_NS" set env deployment/authorino \
             SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
             REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt 2>/dev/null || true
