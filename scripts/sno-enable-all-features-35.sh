@@ -579,6 +579,70 @@ EOF
     oc adm policy add-role-to-user edit \
         "system:serviceaccount:demo:evalhub-${EVALHUB_NS}-job" -n demo 2>/dev/null || true
 
+    # Grant edit to the evalhub SA in demo (needed for adapter image builds:
+    # ImageStreams, BuildConfigs created during benchmark adapter builds)
+    if ! oc get rolebinding -n demo -o jsonpath='{.items[*].subjects[*].name}' 2>/dev/null \
+        | tr ' ' '\n' | grep -qx "evalhub"; then
+        oc adm policy add-role-to-user edit \
+            "system:serviceaccount:demo:evalhub" -n demo 2>/dev/null || true
+        success "evalhub SA granted edit in demo"
+    else
+        success "evalhub SA already has edit in demo ✓"
+    fi
+
+    # Grant evalhub-service SA secret CRUD in demo (the sidecar running as
+    # evalhub-service from redhat-ods-applications needs to read/create secrets
+    # like model-api-key in the target namespace)
+    if ! oc get role evalhub-secret-access -n demo &>/dev/null 2>&1; then
+        oc apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: evalhub-secret-access
+  namespace: demo
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: evalhub-secret-access
+  namespace: demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: evalhub-secret-access
+subjects:
+- kind: ServiceAccount
+  name: evalhub-service
+  namespace: ${EVALHUB_NS}
+EOF
+        success "evalhub-service SA granted secret access in demo"
+    else
+        success "evalhub-service secret access already configured ✓"
+    fi
+
+    # Copy evalhub-service-ca ConfigMap to demo namespace (eval job pods mount
+    # this volume for TLS trust back to the EvalHub API)
+    if ! oc get configmap evalhub-service-ca -n demo &>/dev/null 2>&1; then
+        if oc get configmap evalhub-service-ca -n "$EVALHUB_NS" &>/dev/null 2>&1; then
+            oc get configmap evalhub-service-ca -n "$EVALHUB_NS" -o json \
+                | python3 -c "
+import json, sys
+cm = json.load(sys.stdin)
+cm['metadata'] = {'name': cm['metadata']['name'], 'namespace': 'demo'}
+json.dump(cm, sys.stdout)
+" | oc apply -f -
+            success "evalhub-service-ca ConfigMap copied to demo"
+        else
+            warn "evalhub-service-ca ConfigMap not found in $EVALHUB_NS — eval jobs may fail to mount TLS volume"
+        fi
+    else
+        success "evalhub-service-ca ConfigMap already in demo ✓"
+    fi
+
     success "EvalHub RBAC configured for demo namespace"
 else
     warn "EvalHub CRD not available yet — EvalHub will be created on next run"
