@@ -943,20 +943,71 @@ fi
 # The Kuadrant CR activates RHCL features: AuthPolicy, RateLimitPolicy,
 # TokenRateLimitPolicy, DNSPolicy, and TLSPolicy. Without it, RHCL is
 # installed but inactive — the Connectivity Link menu shows no resources.
+#
+# IMPORTANT: Kuadrant CR MUST be in kuadrant-system namespace.
+# The MaaS controller (odh-model-controller) hardcodes kuadrant-system
+# in the maas-default-gateway-authn-ssl EnvoyFilter. Placing Kuadrant
+# elsewhere causes the gateway auth cluster to target the wrong service.
+KUADRANT_NS="kuadrant-system"
 if oc get crd kuadrants.kuadrant.io &>/dev/null 2>&1; then
+    # Migrate from old location if needed
     if oc get kuadrant kuadrant -n redhat-connectivity-link-operator &>/dev/null 2>&1; then
-        success "Kuadrant CR already exists ✓"
+        warn "Kuadrant CR in wrong namespace (redhat-connectivity-link-operator) — migrating to $KUADRANT_NS"
+        oc delete kuadrant kuadrant -n redhat-connectivity-link-operator --wait=false 2>/dev/null || true
+        sleep 5
+    fi
+    if oc get kuadrant kuadrant -n "$KUADRANT_NS" &>/dev/null 2>&1; then
+        success "Kuadrant CR already exists in $KUADRANT_NS ✓"
     else
-        info "Creating Kuadrant CR..."
-        oc apply -f - <<'EOF'
+        info "Creating Kuadrant CR in $KUADRANT_NS..."
+        oc create namespace "$KUADRANT_NS" 2>/dev/null || true
+        oc apply -f - <<EOF
 apiVersion: kuadrant.io/v1beta1
 kind: Kuadrant
 metadata:
   name: kuadrant
-  namespace: redhat-connectivity-link-operator
+  namespace: ${KUADRANT_NS}
 spec: {}
 EOF
-        success "Kuadrant CR created (activates RHCL features)"
+        info "Waiting for Kuadrant to become Ready..."
+        WAIT=0
+        while [ $WAIT -lt 60 ]; do
+            KREADY=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
+                -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+            [ "$KREADY" = "True" ] && break
+            sleep 5; WAIT=$((WAIT + 5))
+        done
+        success "Kuadrant CR created in $KUADRANT_NS (activates RHCL features)"
+    fi
+
+    # Configure Authorino TLS in kuadrant-system (required for MaaS gateway auth)
+    # The Kuadrant CR auto-creates Authorino; we add TLS using OpenShift service-ca.
+    AUTHORINO_TLS=$(oc get authorino authorino -n "$KUADRANT_NS" \
+        -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
+    if [ "$AUTHORINO_TLS" = "true" ]; then
+        success "Authorino TLS already enabled in $KUADRANT_NS ✓"
+    elif oc get authorino authorino -n "$KUADRANT_NS" &>/dev/null 2>&1; then
+        info "Configuring Authorino TLS in $KUADRANT_NS..."
+        # Annotate service for service-ca cert generation
+        oc annotate service authorino-authorino-authorization \
+            -n "$KUADRANT_NS" \
+            service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
+            --overwrite 2>/dev/null || true
+        # Wait for cert
+        WAIT=0
+        while [ $WAIT -lt 30 ]; do
+            oc get secret authorino-server-cert -n "$KUADRANT_NS" &>/dev/null 2>&1 && break
+            sleep 3; WAIT=$((WAIT + 3))
+        done
+        # Enable TLS on Authorino
+        oc patch authorino authorino -n "$KUADRANT_NS" --type=merge -p '{
+          "spec": { "listener": { "tls": { "enabled": true, "certSecretRef": { "name": "authorino-server-cert" } } } }
+        }' 2>/dev/null || true
+        # SSL env vars for Authorino deployment
+        oc -n "$KUADRANT_NS" set env deployment/authorino \
+            SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
+            REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt 2>/dev/null || true
+        success "Authorino TLS configured in $KUADRANT_NS"
     fi
 else
     warn "Kuadrant CRD not ready yet — Kuadrant CR will be created on next run"
@@ -1187,10 +1238,14 @@ done
 
 echo ""
 info "Operator CRs:"
-# Kuadrant CR
-KUADRANT_READY=$(oc get kuadrant kuadrant -n redhat-connectivity-link-operator \
+# Kuadrant CR (must be in kuadrant-system)
+KUADRANT_READY=$(oc get kuadrant kuadrant -n kuadrant-system \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-[ "$KUADRANT_READY" = "True" ] && echo "  ✅ Kuadrant CR (Ready)" || echo "  ⬚  Kuadrant CR (${KUADRANT_READY:-not found})"
+[ "$KUADRANT_READY" = "True" ] && echo "  ✅ Kuadrant CR (Ready in kuadrant-system)" || echo "  ⬚  Kuadrant CR (${KUADRANT_READY:-not found})"
+# Authorino TLS in kuadrant-system
+AUTHORINO_TLS=$(oc get authorino authorino -n kuadrant-system \
+    -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
+[ "$AUTHORINO_TLS" = "true" ] && echo "  ✅ Authorino TLS (enabled)" || echo "  ⬚  Authorino TLS (${AUTHORINO_TLS:-not configured})"
 # LWS operator CR
 LWS_AVAILABLE=$(oc get leaderworkersetoperator cluster -n openshift-lws-operator \
     -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)

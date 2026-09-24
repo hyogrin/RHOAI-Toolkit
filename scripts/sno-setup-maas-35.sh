@@ -7,10 +7,12 @@
 # via OpenShift service-ca, and optionally sets up Redis rate limiting.
 #
 # Key design decisions (RHOAI 3.5.1):
-#   - maas-db-config secret goes in redhat-ai-gateway-infra (not redhat-ods-applications)
-#   - Authorino CR uses v1beta1 API
-#   - Authorino is created WITHOUT TLS first, then service-ca generates
-#     the cert, then TLS is enabled (avoids chicken-and-egg deadlock)
+#   - Kuadrant CR MUST be in kuadrant-system namespace. The MaaS controller
+#     (odh-model-controller) hardcodes kuadrant-system in the EnvoyFilter
+#     that connects the gateway to Authorino. Wrong namespace = 500 errors.
+#   - Authorino TLS is configured via OpenShift service-ca (service annotation
+#     → cert secret → patch Authorino listener → SSL env vars)
+#   - maas-db-config secret goes in redhat-ai-gateway-infra (where maas-api runs)
 #   - PostgreSQL DB URL uses FQDN for cross-namespace DNS resolution
 #   - Current user is added to rhods-admins group for subscription auth
 #
@@ -20,12 +22,11 @@
 #   3. Verify with:  curl /v1/models  (via MaaS endpoint)
 #
 # Known issue (RHOAI 3.5.1):
-#   MaaS gateway chat/completions may return empty (0-byte) responses when
-#   an active subscription with TokenRateLimitPolicy exists. This is caused
-#   by the Kuadrant wasm ratelimit-report (responseBodyJSON) conflicting
-#   with ext_proc (FULL_DUPLEX_STREAMED) response body processing.
-#   Workaround: Playground/inference clients should connect to vLLM
-#   service directly instead of going through MaaS gateway.
+#   Non-streaming chat/completions via MaaS gateway may return empty (0-byte)
+#   responses. This is caused by the payload-processing ext_proc filter's
+#   FULL_DUPLEX_STREAMED response body mode conflicting with single-body
+#   (non-streaming) responses. Streaming (stream:true) works correctly.
+#   Playground uses streaming by default, so it is not affected.
 #
 # Usage:
 #   bash sno-setup-maas-35.sh                                  # POC PostgreSQL
@@ -301,85 +302,89 @@ fi
 echo ""
 
 ###############################################################################
-# Step 2. Authorino + TLS (service-ca method)
-#   Order: create Authorino WITHOUT TLS → wait for service → annotate for
-#   service-ca cert → wait for cert → patch to enable TLS.
-#   This avoids the chicken-and-egg problem where Authorino won't start
-#   without the TLS cert, but the cert can't be generated without the service.
+# Step 2. Authorino TLS (service-ca method) in kuadrant-system
+#   The Kuadrant CR (created by sno-enable-all-features-35.sh) auto-creates
+#   Authorino in kuadrant-system. This step ensures TLS is configured.
+#
+#   IMPORTANT: The MaaS controller (odh-model-controller) hardcodes
+#   kuadrant-system in the maas-default-gateway-authn-ssl EnvoyFilter.
+#   The Kuadrant-managed Authorino MUST be in kuadrant-system.
+#
+#   Order: wait for Authorino service → annotate for service-ca cert →
+#   wait for cert → patch to enable TLS.
 ###############################################################################
-info "=== Step 2/5: Authorino + TLS configuration ==="
+info "=== Step 2/5: Authorino TLS configuration (kuadrant-system) ==="
 
-# Detect Authorino CRD API version
-AUTHORINO_API_VERSION="operator.authorino.kuadrant.io/v1beta1"
-if oc get crd authorinos.operator.authorino.kuadrant.io -o jsonpath='{.spec.versions[*].name}' 2>/dev/null | grep -q "v1beta2"; then
-    AUTHORINO_API_VERSION="operator.authorino.kuadrant.io/v1beta2"
+KUADRANT_NS="kuadrant-system"
+
+# Ensure Kuadrant CR exists in kuadrant-system
+if ! oc get kuadrant kuadrant -n "$KUADRANT_NS" &>/dev/null 2>&1; then
+    info "Kuadrant CR not found in $KUADRANT_NS — creating..."
+    oc create namespace "$KUADRANT_NS" 2>/dev/null || true
+    oc apply -f - <<EOF
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: ${KUADRANT_NS}
+spec: {}
+EOF
+    info "Waiting for Kuadrant to become Ready..."
+    WAIT=0
+    while [ $WAIT -lt 60 ]; do
+        KREADY=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+        [ "$KREADY" = "True" ] && break
+        sleep 5; WAIT=$((WAIT + 5))
+    done
 fi
-info "Authorino API: $AUTHORINO_API_VERSION"
+success "Kuadrant CR in $KUADRANT_NS ✓"
 
 # Check if Authorino is already running with TLS
-AUTHORINO_READY=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+AUTHORINO_READY=$(oc get authorino authorino -n "$KUADRANT_NS" \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-AUTHORINO_TLS=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+AUTHORINO_TLS=$(oc get authorino authorino -n "$KUADRANT_NS" \
     -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
 
 if [ "$AUTHORINO_READY" = "True" ] && [ "$AUTHORINO_TLS" = "true" ]; then
-    success "Authorino already running with TLS ✓"
+    success "Authorino already running with TLS in $KUADRANT_NS ✓"
 else
-    # Step 2a: Create or patch Authorino WITHOUT TLS to get the service created
-    info "Creating Authorino instance (TLS disabled initially)..."
-    oc apply -f - <<EOF
-apiVersion: ${AUTHORINO_API_VERSION}
-kind: Authorino
-metadata:
-  name: authorino
-  namespace: ${MAAS_INFRA_NS}
-spec:
-  authConfigLabelSelectors: security.opendatahub.io/authorization-group=default
-  clusterWide: true
-  listener:
-    tls:
-      enabled: false
-  oidcServer:
-    tls:
-      enabled: false
-EOF
-
-    # Step 2b: Wait for Authorino service to appear
-    info "Waiting for Authorino service..."
+    # Wait for Authorino service (auto-created by Kuadrant CR)
+    info "Waiting for Authorino service in $KUADRANT_NS..."
     WAIT=0
     while [ $WAIT -lt 90 ]; do
-        if oc get svc authorino-authorino-authorization -n "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
-            success "Authorino service created"
+        if oc get svc authorino-authorino-authorization -n "$KUADRANT_NS" &>/dev/null 2>&1; then
+            success "Authorino service found"
             break
         fi
         sleep 5; WAIT=$((WAIT + 5))
     done
 
-    if ! oc get svc authorino-authorino-authorization -n "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
-        warn "Authorino service not created after 90s — check operator logs"
+    if ! oc get svc authorino-authorino-authorization -n "$KUADRANT_NS" &>/dev/null 2>&1; then
+        warn "Authorino service not found after 90s — check Kuadrant operator logs"
     else
-        # Step 2c: Annotate service for service-ca TLS cert generation
+        # Annotate service for service-ca TLS cert generation
         info "Annotating service for service-ca TLS cert..."
         oc annotate service authorino-authorino-authorization \
-            -n "$MAAS_INFRA_NS" \
+            -n "$KUADRANT_NS" \
             service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
             --overwrite
 
-        # Step 2d: Wait for service-ca to generate the cert
+        # Wait for service-ca to generate the cert
         info "Waiting for TLS cert generation..."
         WAIT=0
         while [ $WAIT -lt 60 ]; do
-            if oc get secret authorino-server-cert -n "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
+            if oc get secret authorino-server-cert -n "$KUADRANT_NS" &>/dev/null 2>&1; then
                 success "TLS cert generated (authorino-server-cert)"
                 break
             fi
             sleep 3; WAIT=$((WAIT + 3))
         done
 
-        if oc get secret authorino-server-cert -n "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
-            # Step 2e: Enable TLS on Authorino
+        if oc get secret authorino-server-cert -n "$KUADRANT_NS" &>/dev/null 2>&1; then
+            # Enable TLS on Authorino
             info "Enabling TLS on Authorino..."
-            oc patch authorino authorino -n "$MAAS_INFRA_NS" --type=merge -p '{
+            oc patch authorino authorino -n "$KUADRANT_NS" --type=merge -p '{
               "spec": {
                 "listener": {
                   "tls": {
@@ -390,17 +395,22 @@ EOF
               }
             }'
 
+            # SSL env vars for Authorino deployment (cluster CA for outbound TLS)
+            oc -n "$KUADRANT_NS" set env deployment/authorino \
+                SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
+                REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt 2>/dev/null || true
+
             # Wait for Authorino to reconcile with TLS
             info "Waiting for Authorino to become ready with TLS..."
             WAIT=0
             while [ $WAIT -lt 60 ]; do
-                READY=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+                READY=$(oc get authorino authorino -n "$KUADRANT_NS" \
                     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
                 [ "$READY" = "True" ] && break
                 sleep 5; WAIT=$((WAIT + 5))
             done
 
-            READY=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+            READY=$(oc get authorino authorino -n "$KUADRANT_NS" \
                 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
             [ "$READY" = "True" ] && success "Authorino ready with TLS ✓" || \
                 warn "Authorino not fully ready yet (will reconcile in background)"
@@ -411,12 +421,13 @@ EOF
 fi
 
 # Annotate MaaS gateway for Authorino TLS bootstrap
+# This tells the MaaS controller to create an EnvoyFilter with TLS transport_socket
 oc annotate gateway maas-default-gateway \
     -n openshift-ingress \
     security.opendatahub.io/authorino-tls-bootstrap="true" \
     --overwrite 2>/dev/null || warn "Could not annotate maas-default-gateway"
 
-success "Authorino + TLS configuration complete"
+success "Authorino TLS configuration complete"
 echo ""
 
 ###############################################################################
@@ -467,20 +478,20 @@ EOF
         success "Redis deployed"
     fi
 
-    # Redis connection secret
-    if ! oc get secret limitador-redis-config -n "$MAAS_INFRA_NS" &>/dev/null; then
+    # Redis connection secret (in kuadrant-system where Limitador runs)
+    if ! oc get secret limitador-redis-config -n "$KUADRANT_NS" &>/dev/null; then
         oc create secret generic limitador-redis-config \
             --from-literal=URL="redis://limitador-redis.${MAAS_INFRA_NS}.svc.cluster.local:6379" \
-            -n "$MAAS_INFRA_NS"
+            -n "$KUADRANT_NS"
     fi
 
-    # Patch Limitador for redis-cached storage (CRD may not exist in all versions)
+    # Patch Limitador for redis-cached storage (Limitador is in kuadrant-system)
     if oc get crd limitadors.limitador.kuadrant.io &>/dev/null 2>&1; then
-        CURRENT_STORAGE=$(oc get limitador limitador -n "$MAAS_INFRA_NS" \
+        CURRENT_STORAGE=$(oc get limitador limitador -n "$KUADRANT_NS" \
             -o jsonpath='{.spec.storage.redis-cached}' 2>/dev/null || true)
         if [ -z "$CURRENT_STORAGE" ]; then
             info "Configuring Limitador with redis-cached storage..."
-            if oc patch limitador limitador -n "$MAAS_INFRA_NS" --type=merge -p '{
+            if oc patch limitador limitador -n "$KUADRANT_NS" --type=merge -p '{
                 "spec": {
                     "storage": {
                         "redis-cached": {
@@ -669,17 +680,17 @@ else
     echo "  ⬚  maas-db-config NOT FOUND in $MAAS_INFRA_NS"
 fi
 
-# Authorino TLS
-TLS_ENABLED=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+# Authorino TLS (in kuadrant-system)
+TLS_ENABLED=$(oc get authorino authorino -n "$KUADRANT_NS" \
     -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || true)
-AUTHORINO_READY=$(oc get authorino authorino -n "$MAAS_INFRA_NS" \
+AUTHORINO_READY=$(oc get authorino authorino -n "$KUADRANT_NS" \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
 if [ "$TLS_ENABLED" = "true" ] && [ "$AUTHORINO_READY" = "True" ]; then
-    echo "  ✅ Authorino TLS enabled & ready"
+    echo "  ✅ Authorino TLS enabled & ready ($KUADRANT_NS)"
 elif [ "$TLS_ENABLED" = "true" ]; then
-    echo "  ⬚  Authorino TLS enabled but not ready yet"
+    echo "  ⬚  Authorino TLS enabled but not ready yet ($KUADRANT_NS)"
 else
-    echo "  ⬚  Authorino TLS not enabled"
+    echo "  ⬚  Authorino TLS not enabled ($KUADRANT_NS)"
 fi
 
 # Kuadrant operator
@@ -767,7 +778,7 @@ echo "     TOKEN=\$(oc whoami -t)"
 echo "     curl -sk ${MAAS_ENDPOINT}/v1/models -H \"Authorization: Bearer \$TOKEN\""
 echo ""
 echo "  ⚠ Known issue (RHOAI 3.5.1):"
-echo "    chat/completions via MaaS gateway may return empty body when"
-echo "    subscription has active TokenRateLimitPolicy (wasm/ext_proc conflict)."
-echo "    Workaround: connect Playground/clients to vLLM service directly."
+echo "    Non-streaming chat/completions via MaaS gateway may return empty body."
+echo "    Caused by ext_proc (FULL_DUPLEX_STREAMED) response body processing."
+echo "    Streaming (stream:true) works correctly — Playground uses streaming."
 echo "=============================================="
