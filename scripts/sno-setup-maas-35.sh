@@ -12,6 +12,20 @@
 #   - Authorino is created WITHOUT TLS first, then service-ca generates
 #     the cert, then TLS is enabled (avoids chicken-and-egg deadlock)
 #   - PostgreSQL DB URL uses FQDN for cross-namespace DNS resolution
+#   - Current user is added to rhods-admins group for subscription auth
+#
+# Workflow after this script:
+#   1. Deploy a model via Dashboard (vLLM runtime → InferenceService)
+#   2. Register Subscription + Auth Policy via Dashboard
+#   3. Verify with:  curl /v1/models  (via MaaS endpoint)
+#
+# Known issue (RHOAI 3.5.1):
+#   MaaS gateway chat/completions may return empty (0-byte) responses when
+#   an active subscription with TokenRateLimitPolicy exists. This is caused
+#   by the Kuadrant wasm ratelimit-report (responseBodyJSON) conflicting
+#   with ext_proc (FULL_DUPLEX_STREAMED) response body processing.
+#   Workaround: Playground/inference clients should connect to vLLM
+#   service directly instead of going through MaaS gateway.
 #
 # Usage:
 #   bash sno-setup-maas-35.sh                                  # POC PostgreSQL
@@ -127,6 +141,20 @@ if ! oc get ns "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
 fi
 success "Namespace: $MAAS_INFRA_NS ✓"
 
+# Add current user to rhods-admins group (required for MaaS subscription auth)
+CURRENT_USER=$(oc whoami)
+if oc get group rhods-admins &>/dev/null 2>&1; then
+    if oc get group rhods-admins -o jsonpath='{.users}' 2>/dev/null | grep -q "\"${CURRENT_USER}\""; then
+        success "${CURRENT_USER} already in rhods-admins ✓"
+    else
+        info "Adding ${CURRENT_USER} to rhods-admins group..."
+        oc adm groups add-users rhods-admins "$CURRENT_USER" 2>/dev/null || true
+        success "${CURRENT_USER} added to rhods-admins"
+    fi
+else
+    warn "rhods-admins group not found — will be created when RHOAI reconciles"
+fi
+
 echo ""
 
 # Determine the namespace where PostgreSQL is deployed
@@ -138,7 +166,7 @@ PG_DEPLOY_NS="redhat-ods-applications"
 #   maas-db-config secret goes in redhat-ai-gateway-infra (where maas-api runs).
 #   DB URL must use FQDN for cross-namespace DNS resolution.
 ###############################################################################
-info "=== Step 1/4: PostgreSQL database ==="
+info "=== Step 1/5: PostgreSQL database ==="
 
 if oc get secret maas-db-config -n "$MAAS_INFRA_NS" &>/dev/null; then
     success "maas-db-config secret already exists in $MAAS_INFRA_NS [SKIP]"
@@ -279,7 +307,7 @@ echo ""
 #   This avoids the chicken-and-egg problem where Authorino won't start
 #   without the TLS cert, but the cert can't be generated without the service.
 ###############################################################################
-info "=== Step 2/4: Authorino + TLS configuration ==="
+info "=== Step 2/5: Authorino + TLS configuration ==="
 
 # Detect Authorino CRD API version
 AUTHORINO_API_VERSION="operator.authorino.kuadrant.io/v1beta1"
@@ -395,10 +423,10 @@ echo ""
 # Step 3. Rate limiting (Redis + EnvoyFilters)
 ###############################################################################
 if [ "$SKIP_RATE_LIMITING" = true ]; then
-    info "=== Step 3/4: Rate limiting [SKIPPED] ==="
+    info "=== Step 3/5: Rate limiting [SKIPPED] ==="
     echo ""
 else
-    info "=== Step 3/4: Rate limiting (Redis + EnvoyFilters) ==="
+    info "=== Step 3/5: Rate limiting (Redis + EnvoyFilters) ==="
 
     # Redis for rate limiting
     if oc get deployment limitador-redis -n "$MAAS_INFRA_NS" &>/dev/null; then
@@ -574,9 +602,63 @@ fi
 echo ""
 
 ###############################################################################
-# Step 4. Verification
+# Step 4. Wait for Kuadrant AuthPolicy reconciliation
+#   The Kuadrant operator must successfully reconcile the gateway AuthPolicy
+#   and create the kuadrant-auth EnvoyFilter. If the EnvoyFilter is stale
+#   from a previous run, delete the operator pod to force a fresh reconcile.
 ###############################################################################
-info "=== Step 4/4: Verification ==="
+info "=== Step 4/5: Kuadrant AuthPolicy reconciliation ==="
+
+# Ensure Kuadrant operator is running (serves wasm binary for gateway)
+KUADRANT_REPLICAS=$(oc get deployment kuadrant-operator-controller-manager \
+    -n redhat-connectivity-link-operator -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+if [ "$KUADRANT_REPLICAS" = "0" ]; then
+    info "Kuadrant operator scaled to 0 — scaling up (required for wasm binary)..."
+    oc scale deployment kuadrant-operator-controller-manager \
+        -n redhat-connectivity-link-operator --replicas=1 2>/dev/null
+    oc wait --for=condition=Available \
+        deployment/kuadrant-operator-controller-manager \
+        -n redhat-connectivity-link-operator --timeout=60s 2>/dev/null || true
+fi
+
+# Wait for gateway AuthPolicy to be enforced
+info "Waiting for gateway AuthPolicy to be enforced (up to 90s)..."
+WAIT=0
+while [ $WAIT -lt 90 ]; do
+    ENFORCED=$(oc get authpolicy maas-gateway-auth -n openshift-ingress \
+        -o jsonpath='{.status.conditions[?(@.type=="Enforced")].status}' 2>/dev/null || true)
+    if [ "$ENFORCED" = "True" ]; then
+        success "Gateway AuthPolicy enforced ✓"
+        break
+    fi
+    sleep 10; WAIT=$((WAIT + 10))
+
+    # If stuck on EnvoyFilter sync, delete operator pod to force fresh cache
+    if [ $WAIT -eq 30 ]; then
+        ENFORCED_MSG=$(oc get authpolicy maas-gateway-auth -n openshift-ingress \
+            -o jsonpath='{.status.conditions[?(@.type=="Enforced")].message}' 2>/dev/null || true)
+        if echo "$ENFORCED_MSG" | grep -q "EnvoyFilter"; then
+            warn "EnvoyFilter sync stuck — restarting Kuadrant operator pod..."
+            oc delete pod -n redhat-connectivity-link-operator \
+                -l control-plane=kuadrant-operator --force --grace-period=0 2>/dev/null || true
+            sleep 10
+            oc wait --for=condition=Available \
+                deployment/kuadrant-operator-controller-manager \
+                -n redhat-connectivity-link-operator --timeout=60s 2>/dev/null || true
+        fi
+    fi
+done
+
+if [ "$ENFORCED" != "True" ]; then
+    warn "Gateway AuthPolicy not enforced yet — subscription auth may not work immediately"
+    warn "It may take a few minutes for the operator to reconcile"
+fi
+echo ""
+
+###############################################################################
+# Step 5. Verification
+###############################################################################
+info "=== Step 5/5: Verification ==="
 
 # maas-db-config
 if oc get secret maas-db-config -n "$MAAS_INFRA_NS" &>/dev/null; then
@@ -600,9 +682,27 @@ else
     echo "  ⬚  Authorino TLS not enabled"
 fi
 
+# Kuadrant operator
+KUADRANT_READY=$(oc get deployment kuadrant-operator-controller-manager \
+    -n redhat-connectivity-link-operator -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+[ "${KUADRANT_READY:-0}" -ge 1 ] && echo "  ✅ Kuadrant operator running" || echo "  ⬚  Kuadrant operator not ready"
+
+# Gateway AuthPolicy
+ENFORCED=$(oc get authpolicy maas-gateway-auth -n openshift-ingress \
+    -o jsonpath='{.status.conditions[?(@.type=="Enforced")].status}' 2>/dev/null || true)
+[ "$ENFORCED" = "True" ] && echo "  ✅ Gateway AuthPolicy enforced" || echo "  ⬚  Gateway AuthPolicy not enforced"
+
 # maas-api
 MAAS_API_RUNNING=$(oc get pods -n "$MAAS_INFRA_NS" --no-headers 2>/dev/null | grep "maas-api" | grep -c "1/1.*Running" || true)
 [ "$MAAS_API_RUNNING" -ge 1 ] && echo "  ✅ maas-api running" || echo "  ⬚  maas-api not running"
+
+# rhods-admins group
+CURRENT_USER=$(oc whoami)
+if oc get group rhods-admins -o jsonpath='{.users}' 2>/dev/null | grep -q "\"${CURRENT_USER}\""; then
+    echo "  ✅ ${CURRENT_USER} in rhods-admins group"
+else
+    echo "  ⬚  ${CURRENT_USER} NOT in rhods-admins group"
+fi
 
 # MaaS Tenant
 TENANT_READY=$(oc get tenant default-tenant -n models-as-a-service \
@@ -646,17 +746,28 @@ else
 fi
 
 CLUSTER_DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')
+MAAS_ENDPOINT="https://maas.${CLUSTER_DOMAIN}"
+DASHBOARD_URL=$(oc get route data-science-gateway -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || \
+               oc get route rh-ai -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || \
+               echo "data-science-gateway.${CLUSTER_DOMAIN}")
 
 echo ""
 echo "=============================================="
 success "MaaS setup complete!"
 echo ""
-echo "  MaaS endpoint:  https://maas.${CLUSTER_DOMAIN}"
-DASHBOARD_URL=$(oc get route data-science-gateway -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || \
-               oc get route rh-ai -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null || \
-               echo "data-science-gateway.${CLUSTER_DOMAIN}")
+echo "  MaaS endpoint:  ${MAAS_ENDPOINT}"
 echo "  Dashboard:      https://${DASHBOARD_URL}"
 echo ""
-echo "  Deploy a model via Dashboard → Models → llm-d runtime"
-echo "  or use LLMInferenceService CR (see docs)"
+echo "  Next steps:"
+echo "  ────────────────────────────────────────────"
+echo "  1. Deploy model:  Dashboard → Gen AI Studio → Deploy (vLLM runtime)"
+echo "  2. Register subscription + auth policy via Dashboard"
+echo "  3. Verify:"
+echo "     TOKEN=\$(oc whoami -t)"
+echo "     curl -sk ${MAAS_ENDPOINT}/v1/models -H \"Authorization: Bearer \$TOKEN\""
+echo ""
+echo "  ⚠ Known issue (RHOAI 3.5.1):"
+echo "    chat/completions via MaaS gateway may return empty body when"
+echo "    subscription has active TokenRateLimitPolicy (wasm/ext_proc conflict)."
+echo "    Workaround: connect Playground/clients to vLLM service directly."
 echo "=============================================="
