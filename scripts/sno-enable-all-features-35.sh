@@ -646,13 +646,10 @@ EOF
     # this volume for TLS trust back to the EvalHub API)
     if ! oc get configmap evalhub-service-ca -n demo &>/dev/null 2>&1; then
         if oc get configmap evalhub-service-ca -n "$EVALHUB_NS" &>/dev/null 2>&1; then
-            oc get configmap evalhub-service-ca -n "$EVALHUB_NS" -o json \
-                | python3 -c "
-import json, sys
-cm = json.load(sys.stdin)
-cm['metadata'] = {'name': cm['metadata']['name'], 'namespace': 'demo'}
-json.dump(cm, sys.stdout)
-" | oc apply -f -
+            oc get configmap evalhub-service-ca -n "$EVALHUB_NS" -o yaml \
+                | sed 's/namespace: '"$EVALHUB_NS"'/namespace: demo/' \
+                | grep -v '^\s*resourceVersion:\|^\s*uid:\|^\s*creationTimestamp:' \
+                | oc apply -f -
             success "evalhub-service-ca ConfigMap copied to demo"
         else
             warn "evalhub-service-ca ConfigMap not found in $EVALHUB_NS — eval jobs may fail to mount TLS volume"
