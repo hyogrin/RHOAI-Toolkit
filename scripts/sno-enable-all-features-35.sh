@@ -6,12 +6,13 @@
 #
 # Execution order is optimized for Web Terminal reliability:
 #   Steps 1-5  — Core configuration (safe, no network disruption)
+#   Step 5b    — Accelerator recording rules (GPU Operator prerequisite only)
 #   Step 6     — Operator install (may briefly disrupt Web Terminal)
 #   Step 7     — Post-operator setup (DSCI monitoring, UIPlugins, CRs)
 #   Step 8     — Dashboard restart (picks up everything)
 #   Step 9     — Verification (best effort)
 #
-# Steps 1-5 complete before any network disruption caused by RHCL/Service
+# Steps 1-5b complete before any network disruption caused by RHCL/Service
 # Mesh installation. If the terminal disconnects during Step 6, operators
 # continue installing via OLM in the background. Re-run the script to
 # pick up where it left off — all steps are idempotent.
@@ -55,8 +56,8 @@ echo "=============================================="
 echo " RHOAI 3.5 SNO — Enable All Features"
 echo "=============================================="
 echo ""
-info "Order: Config (1-5) → Operators (6) → Post-op (7) → Restart (8) → Verify (9)"
-info "Steps 1-5 complete before any network disruption."
+info "Order: Config (1-5b) → Operators (6) → Post-op (7) → Restart (8) → Verify (9)"
+info "Steps 1-5b complete before any network disruption."
 echo ""
 
 ###############################################################################
@@ -790,8 +791,80 @@ oc patch odhdashboardconfig odh-dashboard-config \
 success "Dashboard menu patched"
 echo ""
 
+###############################################################################
+# Step 5b: Accelerator metrics recording rules
+#   GPU Operator is a prerequisite (already installed). This step creates
+#   PrometheusRules that convert DCGM_FI_* metrics into accelerator_*
+#   format expected by RHOAI Observe & Monitor dashboards.
+#   Without these, GPU utilization panels show "No data".
+#   Safe to run here — no dependency on Step 6 operators.
+###############################################################################
+if oc get prometheusrule nvidia-gpu-operator-metrics -n nvidia-gpu-operator &>/dev/null 2>&1; then
+    info "Configuring accelerator metrics recording rules..."
+    oc apply -f - <<'EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: accelerator-recording-rules
+  namespace: nvidia-gpu-operator
+  labels:
+    app: nvidia-gpu-operator
+spec:
+  groups:
+  - name: accelerator.rules
+    interval: 30s
+    rules:
+    - record: accelerator_gpu_utilization
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_GPU_UTIL,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_used_bytes
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_FB_USED * 1024 * 1024,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_total_bytes
+      expr: |
+        label_replace(
+          (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_clock_hertz
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_MEM_CLOCK * 1e6,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_sm_clock_hertz
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_SM_CLOCK * 1e6,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_power_usage_watts
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_POWER_USAGE,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_temperature_celsius
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_GPU_TEMP,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+EOF
+    success "Accelerator metrics recording rules created"
+else
+    info "GPU Operator not installed — accelerator recording rules skipped"
+fi
+echo ""
+
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-success "Core configuration complete (Steps 1-5)."
+success "Core configuration complete (Steps 1-5b)."
 info "Next: operator install (Step 6) may briefly disrupt Web Terminal."
 info "If disconnected, re-run this script — completed steps are skipped."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

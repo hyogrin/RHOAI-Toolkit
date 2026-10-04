@@ -189,6 +189,85 @@ ensure_dsci_observability() {
     fi
 }
 
+ensure_accelerator_metrics() {
+    # RHOAI Observe & Monitor dashboards query accelerator_* metrics (e.g.
+    # accelerator_gpu_utilization), but DCGM Exporter only produces DCGM_FI_*
+    # metrics. This PrometheusRule bridges the gap with recording rules.
+    # Without it, GPU utilization panels show "No data".
+    if ! oc get prometheusrule nvidia-gpu-operator-metrics -n nvidia-gpu-operator &>/dev/null 2>&1; then
+        print_info "GPU Operator not installed — accelerator recording rules skipped"
+        return 0
+    fi
+
+    if oc get prometheusrule accelerator-recording-rules -n nvidia-gpu-operator &>/dev/null 2>&1; then
+        print_info "Accelerator recording rules already exist [SKIP]"
+        return 0
+    fi
+
+    print_step "Creating accelerator metrics recording rules (DCGM → accelerator_*)..."
+    if oc apply -f - <<'ACCEL_EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: accelerator-recording-rules
+  namespace: nvidia-gpu-operator
+  labels:
+    app: nvidia-gpu-operator
+spec:
+  groups:
+  - name: accelerator.rules
+    interval: 30s
+    rules:
+    - record: accelerator_gpu_utilization
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_GPU_UTIL,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_used_bytes
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_FB_USED * 1024 * 1024,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_total_bytes
+      expr: |
+        label_replace(
+          (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_clock_hertz
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_MEM_CLOCK * 1e6,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_sm_clock_hertz
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_SM_CLOCK * 1e6,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_power_usage_watts
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_POWER_USAGE,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_temperature_celsius
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_GPU_TEMP,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+ACCEL_EOF
+    then
+        print_success "Accelerator recording rules created (7 metrics)"
+    else
+        print_warning "Failed to create accelerator recording rules"
+    fi
+}
+
 apply_dashboard_features() {
     print_step "Applying 37 dashboard feature flags for RHOAI 3.5..."
 
@@ -381,6 +460,7 @@ main() {
     # Apply
     check_connection || exit 1
     ensure_dsci_observability
+    ensure_accelerator_metrics
     wait_for_dashboard_config || exit 1
     apply_dashboard_features || exit 1
 

@@ -3,7 +3,7 @@
 # Deploy AutoRAG Demo (RHOAI 3.5)
 ################################################################################
 # Sets up infrastructure for AutoRAG (Technology Preview):
-#   - MinIO for document storage and pipeline artifacts
+#   - SeaweedFS (central, in model-storage ns) for documents and pipeline artifacts
 #   - Milvus vector database (remote — required by AutoRAG)
 #   - Pipeline Server (DSPA) for Kubeflow Pipelines
 #   - S3 data connection and sample documents
@@ -91,10 +91,10 @@ if [ "$DELETE_MODE" = true ]; then
         envsubst < "$SCRIPT_DIR/manifests/llamastack-postgresql.yaml" | oc delete -f - --ignore-not-found 2>/dev/null
     fi
     oc delete configmap autorag-ogx-config -n "$NAMESPACE" --ignore-not-found 2>/dev/null
-    oc delete secret ogx-server-secret llama-stack-secret milvus-connection-secret -n "$NAMESPACE" --ignore-not-found 2>/dev/null
+    oc delete secret ogx-server-secret llama-stack-secret milvus-connection-secret seaweedfs-s3-secret -n "$NAMESPACE" --ignore-not-found 2>/dev/null
     oc delete datasciencepipelineapplication pipelines-definition -n "$NAMESPACE" --ignore-not-found 2>/dev/null
     envsubst < "$SCRIPT_DIR/manifests/milvus.yaml" | oc delete -f - --ignore-not-found 2>/dev/null
-    envsubst < "$SCRIPT_DIR/manifests/minio.yaml" | oc delete -f - --ignore-not-found 2>/dev/null
+    envsubst < "$SCRIPT_DIR/manifests/seaweedfs-connection.yaml" | oc delete -f - --ignore-not-found 2>/dev/null
     print_success "AutoRAG infrastructure removed from $NAMESPACE"
     exit 0
 fi
@@ -122,47 +122,100 @@ oc label namespace "$NAMESPACE" opendatahub.io/dashboard=true --overwrite 2>/dev
 oc patch odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
     --type=merge -p '{"spec":{"dashboardConfig":{"autorag":true}}}' 2>/dev/null || true
 
-# --- Step 1: MinIO for document storage + pipeline artifacts ---
-print_step "Deploying MinIO for document storage..."
-if oc get deployment minio -n "$NAMESPACE" &>/dev/null; then
-    print_info "MinIO already deployed in $NAMESPACE"
-else
-    export NAMESPACE
-    envsubst < "$SCRIPT_DIR/manifests/minio.yaml" | oc apply -f -
-    oc rollout status deployment/minio -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
-fi
+# --- Step 1: SeaweedFS S3 connection (central storage in model-storage ns) ---
+print_step "Creating SeaweedFS S3 connection..."
+export NAMESPACE
+envsubst < "$SCRIPT_DIR/manifests/seaweedfs-connection.yaml" | oc apply -f -
 
-# Create buckets and upload sample docs
+# Create buckets via SeaweedFS S3 API
 print_step "Creating S3 buckets and uploading sample documents..."
-MINIO_POD=$(oc get pod -l app=minio -n "$NAMESPACE" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-if [ -n "$MINIO_POD" ]; then
-    oc exec "$MINIO_POD" -n "$NAMESPACE" -- sh -c '
-        mc alias set local http://localhost:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} 2>/dev/null
-        mc mb --ignore-existing local/pipeline-artifacts 2>/dev/null
-        mc mb --ignore-existing local/autorag-docs 2>/dev/null
-    ' 2>/dev/null || print_warning "Could not create buckets — MinIO may still be starting"
+SEAWEEDFS_S3="http://seaweedfs-s3.model-storage.svc.cluster.local:8333"
 
-    for doc in "$SCRIPT_DIR/sample-data/docs"/*; do
-        if [ -f "$doc" ]; then
-            BASENAME=$(basename "$doc")
-            oc exec -i "$MINIO_POD" -n "$NAMESPACE" -- sh -c "cat > /tmp/$BASENAME" \
-                < "$doc" 2>/dev/null
-            oc exec "$MINIO_POD" -n "$NAMESPACE" -- sh -c \
-                "mc cp /tmp/$BASENAME local/autorag-docs/$BASENAME 2>/dev/null" 2>/dev/null || true
-        fi
-    done
+# Use a Job to create buckets and upload docs (SeaweedFS is in another namespace)
+oc delete job/seaweedfs-setup -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
 
-    # Upload test data for AutoRAG evaluation
-    if [ -f "$SCRIPT_DIR/sample-data/test-data.json" ]; then
-        oc exec -i "$MINIO_POD" -n "$NAMESPACE" -- sh -c "cat > /tmp/test-data.json" \
-            < "$SCRIPT_DIR/sample-data/test-data.json" 2>/dev/null
-        oc exec "$MINIO_POD" -n "$NAMESPACE" -- sh -c \
-            "mc cp /tmp/test-data.json local/autorag-docs/test-data.json 2>/dev/null" 2>/dev/null || true
-    fi
-    print_success "Sample documents and test data uploaded to s3://autorag-docs/"
-else
-    print_warning "MinIO pod not found yet — upload documents after MinIO is ready"
+# Collect sample docs into a ConfigMap for the setup job
+oc delete configmap autorag-sample-docs -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+if ls "$SCRIPT_DIR/sample-data/docs"/* &>/dev/null 2>&1; then
+    oc create configmap autorag-sample-docs -n "$NAMESPACE" \
+        --from-file="$SCRIPT_DIR/sample-data/docs/" 2>/dev/null || true
 fi
+if [ -f "$SCRIPT_DIR/sample-data/test-data.json" ]; then
+    oc create configmap autorag-test-data -n "$NAMESPACE" \
+        --from-file="$SCRIPT_DIR/sample-data/test-data.json" --dry-run=client -o yaml | \
+        oc apply -n "$NAMESPACE" -f - 2>/dev/null || true
+fi
+
+cat <<EOF | oc apply -n "$NAMESPACE" -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seaweedfs-setup
+  namespace: $NAMESPACE
+spec:
+  ttlSecondsAfterFinished: 120
+  template:
+    spec:
+      containers:
+      - name: setup
+        image: quay.io/minio/mc:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            export MC_CONFIG_DIR=/tmp/.mc
+            echo "Connecting to SeaweedFS S3..."
+            until mc alias set sw $SEAWEEDFS_S3 admin admin 2>/dev/null; do
+              echo "Waiting for SeaweedFS..."
+              sleep 3
+            done
+            mc mb --ignore-existing sw/pipeline-artifacts 2>/dev/null || true
+            mc mb --ignore-existing sw/autorag-docs 2>/dev/null || true
+            mc mb --ignore-existing sw/models 2>/dev/null || true
+            echo "Buckets created."
+            # Upload sample docs if mounted
+            if [ -d /sample-docs ]; then
+              for f in /sample-docs/*; do
+                [ -f "\$f" ] && mc cp "\$f" sw/autorag-docs/ 2>/dev/null || true
+              done
+              echo "Sample documents uploaded."
+            fi
+            if [ -f /test-data/test-data.json ]; then
+              mc cp /test-data/test-data.json sw/autorag-docs/ 2>/dev/null || true
+              echo "Test data uploaded."
+            fi
+            echo "Done!"
+        env:
+        - name: SEAWEEDFS_S3
+          value: "$SEAWEEDFS_S3"
+        volumeMounts:
+        - name: sample-docs
+          mountPath: /sample-docs
+          readOnly: true
+        - name: test-data
+          mountPath: /test-data
+          readOnly: true
+      volumes:
+      - name: sample-docs
+        configMap:
+          name: autorag-sample-docs
+          optional: true
+      - name: test-data
+        configMap:
+          name: autorag-test-data
+          optional: true
+      restartPolicy: Never
+  backoffLimit: 3
+EOF
+
+print_info "Waiting for bucket creation..."
+if oc wait --for=condition=complete job/seaweedfs-setup -n "$NAMESPACE" --timeout=120s 2>/dev/null; then
+    print_success "Buckets and sample documents ready"
+else
+    print_warning "Setup job did not complete in 120s — check: oc logs job/seaweedfs-setup -n $NAMESPACE"
+fi
+oc delete job/seaweedfs-setup -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+oc delete configmap autorag-sample-docs autorag-test-data -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
 
 # --- Step 2: S3 data connection ---
 print_step "Creating S3 data connection for AutoRAG documents..."
@@ -180,11 +233,11 @@ metadata:
     openshift.io/display-name: "AutoRAG Documents"
 type: Opaque
 stringData:
-  AWS_ACCESS_KEY_ID: minio
-  AWS_SECRET_ACCESS_KEY: minio123
+  AWS_ACCESS_KEY_ID: admin
+  AWS_SECRET_ACCESS_KEY: admin
   AWS_DEFAULT_REGION: us-east-1
   AWS_S3_BUCKET: autorag-docs
-  AWS_S3_ENDPOINT: http://minio.${NAMESPACE}.svc.cluster.local:9000
+  AWS_S3_ENDPOINT: http://seaweedfs-s3.model-storage.svc.cluster.local:8333
 EOF
 
 # --- Step 3: Milvus vector database ---

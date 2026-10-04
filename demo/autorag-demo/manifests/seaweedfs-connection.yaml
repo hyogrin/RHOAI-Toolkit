@@ -1,0 +1,15 @@
+# SeaweedFS S3 connection secrets for AutoRAG
+# Points to central SeaweedFS deployed in model-storage namespace
+#
+# Variables:
+#   ${NAMESPACE}  - Target namespace for the secrets
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: seaweedfs-s3-secret
+  namespace: ${NAMESPACE}
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: admin
+  AWS_SECRET_ACCESS_KEY: admin

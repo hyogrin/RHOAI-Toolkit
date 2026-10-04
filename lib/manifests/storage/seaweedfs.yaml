@@ -1,0 +1,490 @@
+# SeaweedFS S3-Compatible Object Storage for OpenShift
+# Replaces MinIO for model and pipeline artifact storage
+#
+# Components: Master (topology), Volume (data), Filer+S3 (API gateway)
+# Based on: https://github.com/seaweedfs/seaweedfs/wiki/Getting-Started
+# OpenShift SCC: restricted-v2 compatible
+#
+# Credentials: admin / admin (change in production!)
+# S3 API:   http://seaweedfs-s3:8333 (internal)
+# S3 Route: https://seaweedfs-s3-<namespace>.apps.<cluster>
+# Admin UI: https://seaweedfs-admin-<namespace>.apps.<cluster>
+#
+# Variables (for envsubst):
+#   ${SEAWEEDFS_VOLUME_SIZE}  - Volume data PVC size (default: 10Gi in scripts)
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: seaweedfs
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: storage
+stringData:
+  S3_ACCESS_KEY: admin
+  S3_SECRET_KEY: admin
+  ADMIN_USER: admin
+  ADMIN_PASSWORD: admin
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: seaweedfs-s3-config
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: storage
+data:
+  config.json: |
+    {
+      "identities": [
+        {
+          "name": "admin",
+          "credentials": [
+            {
+              "accessKey": "admin",
+              "secretKey": "admin"
+            }
+          ],
+          "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+        }
+      ]
+    }
+---
+# Master: manages file ID assignment and cluster topology
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-master-data
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: master
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+# Volume: stores actual file data chunks
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-volume-data
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: volume
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+---
+# Filer: provides S3 API and filesystem interface
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-filer-data
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: filer
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs-master
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: master
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: seaweedfs
+      app.kubernetes.io/component: master
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: seaweedfs
+        app.kubernetes.io/component: master
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+      - name: master
+        image: docker.io/chrislusf/seaweedfs:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - master
+        - -ip.bind=0.0.0.0
+        - -port=9333
+        - -mdir=/data
+        - -defaultReplication=000
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+        ports:
+        - name: master
+          containerPort: 9333
+          protocol: TCP
+        - name: master-grpc
+          containerPort: 19333
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: logs
+          mountPath: /logs
+        livenessProbe:
+          httpGet:
+            path: /cluster/status
+            port: master
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /cluster/status
+            port: master
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: seaweedfs-master-data
+      - name: logs
+        emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs-volume
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: volume
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: seaweedfs
+      app.kubernetes.io/component: volume
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: seaweedfs
+        app.kubernetes.io/component: volume
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+      - name: volume
+        image: docker.io/chrislusf/seaweedfs:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - volume
+        - -dir=/data
+        - -max=0
+        - -mserver=seaweedfs-master:9333
+        - -port=8080
+        - -ip.bind=0.0.0.0
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+        ports:
+        - name: volume
+          containerPort: 8080
+          protocol: TCP
+        - name: volume-grpc
+          containerPort: 18080
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: logs
+          mountPath: /logs
+        livenessProbe:
+          httpGet:
+            path: /status
+            port: volume
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /status
+            port: volume
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: seaweedfs-volume-data
+      - name: logs
+        emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs-filer
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: filer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: seaweedfs
+      app.kubernetes.io/component: filer
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: seaweedfs
+        app.kubernetes.io/component: filer
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+      - name: filer
+        image: docker.io/chrislusf/seaweedfs:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - filer
+        - -master=seaweedfs-master:9333
+        - -port=8888
+        - -s3
+        - -s3.port=8333
+        - -s3.config=/etc/seaweedfs/s3/config.json
+        - -ip.bind=0.0.0.0
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+        ports:
+        - name: filer
+          containerPort: 8888
+          protocol: TCP
+        - name: filer-grpc
+          containerPort: 18888
+          protocol: TCP
+        - name: s3
+          containerPort: 8333
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: logs
+          mountPath: /logs
+        - name: s3-config
+          mountPath: /etc/seaweedfs/s3
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /
+            port: filer
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /
+            port: filer
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: seaweedfs-filer-data
+      - name: logs
+        emptyDir: {}
+      - name: s3-config
+        configMap:
+          name: seaweedfs-s3-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs-master
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: master
+spec:
+  type: ClusterIP
+  ports:
+  - name: master
+    port: 9333
+    targetPort: master
+    protocol: TCP
+  - name: master-grpc
+    port: 19333
+    targetPort: master-grpc
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: master
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs-volume
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: volume
+spec:
+  type: ClusterIP
+  ports:
+  - name: volume
+    port: 8080
+    targetPort: volume
+    protocol: TCP
+  - name: volume-grpc
+    port: 18080
+    targetPort: volume-grpc
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: volume
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs-filer
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: filer
+spec:
+  type: ClusterIP
+  ports:
+  - name: filer
+    port: 8888
+    targetPort: filer
+    protocol: TCP
+  - name: filer-grpc
+    port: 18888
+    targetPort: filer-grpc
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: filer
+---
+# S3 API service (points to filer's S3 port)
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs-s3
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: s3
+spec:
+  type: ClusterIP
+  ports:
+  - name: s3
+    port: 8333
+    targetPort: s3
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: filer
+---
+# S3 API external route
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: seaweedfs-s3
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: s3
+spec:
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  port:
+    targetPort: s3
+  to:
+    kind: Service
+    name: seaweedfs-s3
+    weight: 100
+---
+# Admin UI route (filer web interface)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: seaweedfs-admin
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: filer
+spec:
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  port:
+    targetPort: filer
+  to:
+    kind: Service
+    name: seaweedfs-filer
+    weight: 100
+---
+# Master UI route (cluster status)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: seaweedfs-master
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/component: master
+spec:
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  port:
+    targetPort: master
+  to:
+    kind: Service
+    name: seaweedfs-master
+    weight: 100

@@ -1,5 +1,6 @@
 # DataSciencePipelineApplication for AutoRAG
 # AutoRAG uses Kubeflow Pipelines to orchestrate RAG optimization runs.
+# Storage: SeaweedFS in model-storage namespace
 apiVersion: datasciencepipelinesapplications.opendatahub.io/v1
 kind: DataSciencePipelinesApplication
 metadata:
@@ -15,11 +16,11 @@ spec:
   objectStorage:
     externalStorage:
       bucket: pipeline-artifacts
-      host: minio.${NAMESPACE}.svc.cluster.local
-      port: "9000"
+      host: seaweedfs-s3.model-storage.svc.cluster.local
+      port: "8333"
       region: us-east-1
       s3CredentialsSecret:
         accessKey: AWS_ACCESS_KEY_ID
         secretKey: AWS_SECRET_ACCESS_KEY
-        secretName: minio-secret
+        secretName: seaweedfs-s3-secret
       scheme: http
