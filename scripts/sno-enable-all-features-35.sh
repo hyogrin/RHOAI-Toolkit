@@ -1445,27 +1445,6 @@ DCGMEOF
     [ "${PERSES_STATUS:-}" != "True" ] && warn "Perses not ready yet (will reconcile in background)"
 fi
 
-# Patch openshift-ai-inference Gateway to allow all DS project namespaces
-# KServe creates this gateway with a hard-coded namespace list. Without this
-# patch, vLLM InferenceService / LLMInferenceService deployments in new DS
-# projects fail with "NotAllowedByListeners". Using the opendatahub.io/dashboard
-# label means any DS project created via the dashboard is automatically allowed.
-if oc get gateway openshift-ai-inference -n openshift-ingress &>/dev/null; then
-    info "Patching openshift-ai-inference gateway for DS project access..."
-    oc label ns openshift-ingress opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
-    oc label ns redhat-ods-applications opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
-    oc patch gateway openshift-ai-inference -n openshift-ingress --type='json' -p='[
-      {"op":"replace","path":"/spec/listeners/0/allowedRoutes/namespaces","value":{
-        "from":"Selector",
-        "selector":{
-          "matchLabels":{
-            "opendatahub.io/dashboard":"true"
-          }
-        }
-      }}
-    ]' 2>/dev/null && success "Inference gateway: all DS projects allowed" \
-                   || warn "Could not patch inference gateway"
-fi
 echo ""
 
 ###############################################################################

@@ -142,6 +142,32 @@ if ! oc get ns "$MAAS_INFRA_NS" &>/dev/null 2>&1; then
 fi
 success "Namespace: $MAAS_INFRA_NS ✓"
 
+###############################################################################
+# Patch openshift-ai-inference Gateway
+#   KServe creates this gateway with a hard-coded namespace list (snapshot at
+#   creation time) and never updates it. New DS projects get "NotAllowedByListeners"
+#   on HTTPRoutes. Fix: use opendatahub.io/dashboard label selector so any DS
+#   project created via dashboard is automatically allowed.
+#   Needed for both vLLM InferenceService and llm-d LLMInferenceService.
+###############################################################################
+if oc get gateway openshift-ai-inference -n openshift-ingress &>/dev/null; then
+    info "Patching openshift-ai-inference gateway for DS project access..."
+    oc label ns openshift-ingress opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
+    oc label ns redhat-ods-applications opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
+    oc patch gateway openshift-ai-inference -n openshift-ingress --type='json' -p='[
+      {"op":"replace","path":"/spec/listeners/0/allowedRoutes/namespaces","value":{
+        "from":"Selector",
+        "selector":{
+          "matchLabels":{
+            "opendatahub.io/dashboard":"true"
+          }
+        }
+      }}
+    ]' 2>/dev/null && success "Inference gateway: all DS projects allowed" \
+                   || warn "Could not patch inference gateway"
+fi
+echo ""
+
 # Add current user to rhods-admins group (required for MaaS subscription auth)
 CURRENT_USER=$(oc whoami)
 if oc get group rhods-admins &>/dev/null 2>&1; then
