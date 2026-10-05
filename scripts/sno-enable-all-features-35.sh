@@ -1344,6 +1344,94 @@ if $COO_OK; then
     done
     [ "${MON_STATUS:-}" != "True" ] && warn "MonitoringStack not ready yet (will reconcile in background)"
 
+    # DCGM metrics for RHOAI MonitoringStack Prometheus
+    # The RHOAI MonitoringStack Prometheus only scrapes its own namespace by
+    # default. Without this ServiceMonitor, the "LLM Utilization" tab in
+    # Observe & Monitor shows no GPU data (it uses data-science-prometheus-
+    # datasource, NOT the cluster Prometheus).
+    # The recording rule converts DCGM_FI_* → accelerator_* within this Prometheus.
+    if oc get prometheusrule nvidia-gpu-operator-metrics -n nvidia-gpu-operator &>/dev/null 2>&1; then
+        info "Configuring DCGM metrics for RHOAI MonitoringStack..."
+        oc apply -f - <<'DCGMEOF'
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nvidia-dcgm-exporter
+  namespace: redhat-ods-monitoring
+  labels:
+    app: nvidia-dcgm-exporter
+spec:
+  endpoints:
+  - path: /metrics
+    port: gpu-metrics
+  jobLabel: app
+  namespaceSelector:
+    matchNames:
+    - nvidia-gpu-operator
+  selector:
+    matchLabels:
+      app: nvidia-dcgm-exporter
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: accelerator-recording-rules
+  namespace: redhat-ods-monitoring
+  labels:
+    app: nvidia-gpu-operator
+spec:
+  groups:
+  - name: accelerator.rules
+    interval: 30s
+    rules:
+    - record: accelerator_gpu_utilization
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_GPU_UTIL,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_used_bytes
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_FB_USED * 1024 * 1024,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_total_bytes
+      expr: |
+        label_replace(
+          (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_memory_clock_hertz
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_MEM_CLOCK * 1e6,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_sm_clock_hertz
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_SM_CLOCK * 1e6,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_power_usage_watts
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_POWER_USAGE,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+    - record: accelerator_temperature_celsius
+      expr: |
+        label_replace(
+          DCGM_FI_DEV_GPU_TEMP,
+          "k8s_pod_name", "$1", "exported_pod", "(.*)"
+        )
+DCGMEOF
+        success "DCGM ServiceMonitor + recording rules created in redhat-ods-monitoring"
+    else
+        info "GPU Operator not installed — DCGM metrics for RHOAI monitoring skipped"
+    fi
+
     # Wait for Perses
     info "Waiting for Perses..."
     PERSES_STATUS=""
